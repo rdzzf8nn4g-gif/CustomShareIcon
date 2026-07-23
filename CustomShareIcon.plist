@@ -8,6 +8,7 @@
         <array>
             <string>com.apple.UIKit</string>
             <string>com.apple.ShareSheet</string>
+            <string>com.apple.SharingUI</string>
         </array>
     </dict>
 </dict>
