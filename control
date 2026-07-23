@@ -1,1 +1,9 @@
-
+Package: com.iosdump.customshareicon
+Name: CustomShareIcon
+Depends: mobilesubstrate, preferenceloader
+Version: 0.0.1
+Architecture: iphoneos-arm
+Description: iOS 14-17 自定义分享面板 App 图标
+Maintainer: iosdump
+Author: iosdump
+Section: Tweaks
