@@ -1,1 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>items</key>
+    <array>
+        <dict>
+            <key>cell</key> <string>PSGroupCell</string>
+        </dict>
+        <dict>
+            <key>cell</key> <string>PSButtonCell</string>
+            <key>label</key> <string>Telegram频道：https://t.me/iosdumpzzz</string>
+            <key>action</key> <string>openTelegramChannel</string>
+        </dict>
 
+        <dict>
+            <key>cell</key> <string>PSGroupCell</string>
+            <key>label</key> <string>全局设置</string>
+        </dict>
+        <dict>
+            <key>cell</key> <string>PSSwitchCell</string>
+            <key>default</key> <false/>
+            <key>defaults</key> <string>com.iosdump.customshareicon</string>
+            <key>key</key> <string>Enabled</string>
+            <key>label</key> <string>开启自定义图标</string>
+            <key>id</key> <string>Enabled</string>
+        </dict>
+        
+        <dict>
+            <key>cell</key> <string>PSGroupCell</string>
+            <key>label</key> <string>图标管理</string>
+            <key>footerText</key> <string>输入对应App的Bundle ID(如 com.tencent.xin) 或系统动作标识(如 com.apple.UIKit.activity.CopyToPasteboard)并选择图片。</string>
+        </dict>
+        <dict>
+            <key>cell</key> <string>PSButtonCell</string>
+            <key>label</key> <string>+ 添加自定义图标</string>
+            <key>action</key> <string>addNewIcon</string>
+        </dict>
+    </array>
+    <key>title</key>
+    <string>分享图标</string>
+</dict>
+</plist>
