@@ -19,8 +19,6 @@ jobs:
       - name: 🔧 强制修复脚本权限 (Fix Permissions)
         run: |
           mkdir -p layout/DEBIAN
-          chmod +x layout/DEBIAN/postinst
-          chmod +x layout/DEBIAN/postrm
           chmod +x build.sh
       # ==============================================
 
