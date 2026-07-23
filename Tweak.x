@@ -6,10 +6,10 @@
 #define jbroot(path) path
 #endif
 
-// 暴露所需的方法避免编译警告
+// 声明可能用到的私有或公开方法
 @interface UIActivity (CustomShareIcon)
 - (NSString *)activityType;
-- (NSString *)containingAppBundleIdentifier; // UIApplicationExtensionActivity 的方法
+- (NSString *)containingAppBundleIdentifier;
 @end
 
 static NSString * GetMediaDir() {
@@ -43,26 +43,22 @@ static void loadPrefs() {
     isEnabled = dict[@"Enabled"] ? [dict[@"Enabled"] boolValue] : NO;
 }
 
-// 获取自定义图片的通用方法
 static UIImage *getCustomIconForID(NSString *identifier) {
     if (!identifier || identifier.length == 0) return nil;
     
     NSString *path = [[GetMediaDir() stringByAppendingPathComponent:identifier] stringByAppendingPathExtension:@"png"];
     if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
-        // 读取图片并返回
         return [UIImage imageWithContentsOfFile:path];
     }
     return nil;
 }
 
-// 提取当前 Activity 的标识符
-static NSString *getIdentifierForActivity(UIActivity *activity) {
+// 参数改为 id 类型，兼容 UIActivity 及其所有子类（如 UIApplicationExtensionActivity）
+static NSString *getIdentifierForActivity(id activity) {
     NSString *identifier = nil;
-    // 优先尝试获取 App 的 Bundle ID (适用于第三方 App 分享扩展)
     if ([activity respondsToSelector:@selector(containingAppBundleIdentifier)]) {
         identifier = [activity containingAppBundleIdentifier];
     }
-    // 回退到 activityType (适用于系统自带功能，如 com.apple.UIKit.activity.CopyToPasteboard)
     if (!identifier || identifier.length == 0) {
         if ([activity respondsToSelector:@selector(activityType)]) {
             identifier = [activity activityType];
@@ -103,7 +99,6 @@ static NSString *getIdentifierForActivity(UIActivity *activity) {
 
 %end
 
-// 为了防止继承类没走父类，顺便 Hook UIApplicationExtensionActivity
 %hook UIApplicationExtensionActivity
 
 - (UIImage *)activityImage {
