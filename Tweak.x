@@ -38,31 +38,48 @@ static NSMutableDictionary<NSString *, UIImage *> *imageCache = nil;
 static UIImage *testRedImage = nil;
 
 static void loadPrefs() {
-    NSString *rootfulPath = @"/var/mobile/Library/Preferences/com.iosdump.customshareicon.plist";
-    NSString *rootlessPath = @"/var/jb/var/mobile/Library/Preferences/com.iosdump.customshareicon.plist";
-    
-    NSDictionary *prefs = [NSDictionary dictionaryWithContentsOfFile:rootfulPath];
-    if (!prefs) {
-        prefs = [NSDictionary dictionaryWithContentsOfFile:rootlessPath];
-    }
-    
-#ifdef jbroot
-    if (!prefs) {
-        prefs = [NSDictionary dictionaryWithContentsOfFile:jbroot(rootfulPath)];
-    }
-#endif
+    // ========== 强制多路径读取（解决 iOS 17 无根/隐根读不到问题）==========
+    CFPreferencesAppSynchronize(PREFS_DOMAIN);
+    CFPreferencesAppSynchronize(kCFPreferencesAnyApplication);
+    CFPreferencesAppSynchronize(CFSTR("com.iosdump.customshareicon"));
 
-    if (prefs[@"IOSDump_CSI_Icons"] && [prefs[@"IOSDump_CSI_Icons"] isKindOfClass:[NSDictionary class]]) {
-        customIconsDict = [prefs[@"IOSDump_CSI_Icons"] copy];
+    // 额外强制
+    CFPreferencesSynchronize(PREFS_DOMAIN, kCFPreferencesAnyUser, kCFPreferencesAnyHost);
+    CFPreferencesSynchronize(kCFPreferencesAnyApplication, kCFPreferencesAnyUser, kCFPreferencesAnyHost);
+
+    Boolean keyExists = false;
+    Boolean enabledVal = CFPreferencesGetAppBooleanValue(CFSTR("Enabled"), PREFS_DOMAIN, &keyExists);
+    if (!keyExists) {
+        enabledVal = CFPreferencesGetAppBooleanValue(CFSTR("Enabled"), kCFPreferencesAnyApplication, &keyExists);
+    }
+    if (!keyExists) {
+        enabledVal = CFPreferencesGetAppBooleanValue(CFSTR("Enabled"), CFSTR("com.iosdump.customshareicon"), &keyExists);
+    }
+
+    CFPropertyListRef iconsRef = NULL;
+
+    // 路径1
+    iconsRef = CFPreferencesCopyAppValue(CFSTR("IOSDump_CSI_Icons"), PREFS_DOMAIN);
+    // 路径2
+    if (!iconsRef) iconsRef = CFPreferencesCopyAppValue(CFSTR("IOSDump_CSI_Icons"), kCFPreferencesAnyApplication);
+    // 路径3
+    if (!iconsRef) iconsRef = CFPreferencesCopyAppValue(CFSTR("IOSDump_CSI_Icons"), CFSTR("com.iosdump.customshareicon"));
+    // 路径4
+    if (!iconsRef) iconsRef = CFPreferencesCopyValue(CFSTR("IOSDump_CSI_Icons"), PREFS_DOMAIN, kCFPreferencesAnyUser, kCFPreferencesAnyHost);
+    // 路径5
+    if (!iconsRef) iconsRef = CFPreferencesCopyValue(CFSTR("IOSDump_CSI_Icons"), kCFPreferencesAnyApplication, kCFPreferencesAnyUser, kCFPreferencesAnyHost);
+    // 路径6（兼容部分隐根）
+    if (!iconsRef) iconsRef = CFPreferencesCopyValue(CFSTR("IOSDump_CSI_Icons"), CFSTR("com.iosdump.customshareicon"), kCFPreferencesAnyUser, kCFPreferencesAnyHost);
+
+    if (iconsRef && CFGetTypeID(iconsRef) == CFDictionaryGetTypeID()) {
+        customIconsDict = [(__bridge NSDictionary *)iconsRef copy];
     } else {
         customIconsDict = nil;
     }
+    if (iconsRef) CFRelease(iconsRef);
 
-    if (prefs[@"Enabled"]) {
-        isEnabled = [prefs[@"Enabled"] boolValue];
-    } else {
-        isEnabled = (customIconsDict.count > 0);
-    }
+    // 有数据就强制开启
+    isEnabled = (customIconsDict.count > 0) ? YES : (keyExists ? enabledVal : NO);
 
     if (!imageCache) imageCache = [NSMutableDictionary new];
     else [imageCache removeAllObjects];
