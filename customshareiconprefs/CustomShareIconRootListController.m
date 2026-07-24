@@ -1,11 +1,25 @@
 #import "CustomShareIconRootListController.h"
 #import <Preferences/PSSpecifier.h>
 
+#if __has_include(<roothide.h>)
+#import <roothide.h>
+#else
+#define jbroot(path) path
+#endif
+
 // =======================
-// 核心修复：使用 user 级别的 Application Support 目录，设置App绝对有权限写入！
+// 使用最稳定的 Preferences 目录，设置App保证有权写入，守护进程也能读取
 // =======================
 static NSString * GetCSIDir() {
-    return @"/var/mobile/Library/Application Support/com.iosdump.customshareicon";
+    NSString *base = @"/var/mobile/Library/Preferences/com.iosdump.customshareicon.media";
+#if __has_include(<roothide.h>)
+    return jbroot(base);
+#else
+    if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/jb/"]) {
+        return [@"/var/jb" stringByAppendingPathComponent:base];
+    }
+    return base;
+#endif
 }
 
 @implementation CustomShareIconRootListController
@@ -15,7 +29,7 @@ static NSString * GetCSIDir() {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *dir = GetCSIDir();
     
-    // 初始化公共目录
+    // 初始化目录并赋予 0777 最高读写权限
     if (![fm fileExistsAtPath:dir]) {
         [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:@{NSFilePosixPermissions: @0777, NSFileProtectionKey: NSFileProtectionNone} error:nil];
     } else {
@@ -141,11 +155,9 @@ static NSString * GetCSIDir() {
                     NSData *data = UIImagePNGRepresentation(img);
                     NSString *path = [GetCSIDir() stringByAppendingPathComponent:[NSString stringWithFormat:@"%@.png", self.pendingBundleID]];
                     
-                    // 写入数据并赋予读写权限
                     BOOL success = [data writeToFile:path atomically:YES];
                     if (success) {
                         [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions: @0777, NSFileProtectionKey: NSFileProtectionNone} ofItemAtPath:path error:nil];
-                        
                         dispatch_async(dispatch_get_main_queue(), ^{
                             [self reloadSpecifiers];
                             CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(), CFSTR("com.iosdump.customshareicon/ReloadPrefs"), NULL, NULL, YES);
@@ -180,7 +192,6 @@ static NSString * GetCSIDir() {
     return cell;
 }
 
-// 暴力穿透沙盒：把开关状态直接写进物理文件
 - (void)setPreferenceValue:(id)value specifier:(PSSpecifier *)specifier {
     [super setPreferenceValue:value specifier:specifier];
     if ([specifier.identifier isEqualToString:@"Enabled"]) {
@@ -188,7 +199,6 @@ static NSString * GetCSIDir() {
         CFPreferencesSetAppValue((__bridge CFStringRef)specifier.properties[@"key"], (__bridge CFPropertyListRef)value, appID);
         CFPreferencesAppSynchronize(appID);
         
-        // 生成标志文件，0777权限穿透
         NSString *flagPath = [GetCSIDir() stringByAppendingPathComponent:@"enabled.txt"];
         if ([value boolValue]) {
             [@"1" writeToFile:flagPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
