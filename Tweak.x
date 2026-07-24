@@ -63,18 +63,17 @@ static UIImage *getCustomIconForID(NSString *identifier) {
     if (!identifier || identifier.length == 0) return nil;
     NSString *dir = GetMediaDir();
     
-    // 1. 精确匹配 (系统动作，如 com.apple.UIKit.activity.CopyToPasteboard)
+    // 1. 精确匹配
     NSString *exactPath = [[dir stringByAppendingPathComponent:identifier] stringByAppendingPathExtension:@"png"];
     if ([[NSFileManager defaultManager] fileExistsAtPath:exactPath]) {
         return [UIImage imageWithContentsOfFile:exactPath];
     }
     
-    // 2. 智能模糊匹配 (修复核心漏洞：应对 com.apple.UIKit.activity.ApplicationExtension.com.tencent.xin)
+    // 2. 智能模糊匹配 (核心修复：使用 containsString)
     NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil];
     for (NSString *file in files) {
         if ([file hasSuffix:@".png"]) {
             NSString *confID = [file stringByDeletingPathExtension]; 
-            // 核心修复：使用 containsString 而不是 hasPrefix
             if (confID.length > 0 && [identifier containsString:confID]) {
                 NSString *path = [dir stringByAppendingPathComponent:file];
                 return [UIImage imageWithContentsOfFile:path];
@@ -84,7 +83,7 @@ static UIImage *getCustomIconForID(NSString *identifier) {
     return nil;
 }
 
-// 从 Cell 的代理层级中疯狂榨取 Bundle ID
+// 从 Cell 的代理层级中提取 Bundle ID
 static UIImage *getCustomIconForCell(id cell) {
     if (!isEnabled) return nil;
     if (![cell respondsToSelector:@selector(activityProxy)]) return nil;
@@ -112,7 +111,6 @@ static UIImage *getCustomIconForCell(id cell) {
         }
     }
     
-    // 兜底策略：有些版本直接把 activityType 放在 proxy 上
     if ((!identifier || identifier.length == 0) && [proxy respondsToSelector:NSSelectorFromString(@"activityType")]) {
         identifier = [proxy valueForKey:@"activityType"];
     }
@@ -134,18 +132,18 @@ static void applyCustomImageToCell(UICollectionViewCell *cell, UIImage *customIm
     if (slotView) { slotView.hidden = YES; slotView.alpha = 0; }
     if (appleIv) { appleIv.hidden = YES; appleIv.alpha = 0; }
     
-    // 2. 创建或更新我们自己的ImageView，彻底掌控视图
+    // 2. 创建或更新我们自己的ImageView
     UIImageView *customIv = [cell.contentView viewWithTag:TAG_CUSTOM_ICON];
     if (!customIv) {
         customIv = [[UIImageView alloc] init];
         customIv.tag = TAG_CUSTOM_ICON;
         customIv.contentMode = UIViewContentModeScaleAspectFit;
         customIv.clipsToBounds = YES;
-        // 如果是分享面板顶部那种小操作图标，不需要圆角
+        
         if ([NSStringFromClass([cell class]) containsString:@"Action"]) {
             customIv.layer.cornerRadius = 0;
         } else {
-            customIv.layer.cornerRadius = 13.0; // 完美模拟 iOS 原生 App 图标圆角
+            customIv.layer.cornerRadius = 13.0; 
         }
         [cell.contentView addSubview:customIv];
     }
@@ -157,7 +155,6 @@ static void applyCustomImageToCell(UICollectionViewCell *cell, UIImage *customIm
     } else if (appleIv && !CGRectIsEmpty(appleIv.frame)) {
         targetFrame = appleIv.frame;
     } else {
-        // 如果系统没给位置，强制算一个居中的位置
         if ([NSStringFromClass([cell class]) containsString:@"Action"]) {
             targetFrame = CGRectMake((cell.contentView.bounds.size.width - 28)/2, 16, 28, 28);
         } else {
@@ -174,7 +171,6 @@ static void restoreCell(UICollectionViewCell *cell) {
     UIView *slotView = [cell respondsToSelector:@selector(imageSlotView)] ? [cell valueForKey:@"imageSlotView"] : nil;
     UIImageView *appleIv = [cell respondsToSelector:@selector(activityImageView)] ? [cell valueForKey:@"activityImageView"] : nil;
     
-    // 恢复原生图层 (应对 UICollectionViewCell 复用机制)
     if (slotView) { slotView.hidden = NO; slotView.alpha = 1.0; }
     if (appleIv) { appleIv.hidden = NO; appleIv.alpha = 1.0; }
     
@@ -185,24 +181,44 @@ static void restoreCell(UICollectionViewCell *cell) {
 }
 
 // =======================
-// Hook 核心：在视图布局的最后一刻强制执行覆盖
+// 手动展开 Hook (避开宏解析报错)
 // =======================
-#define HOOK_CELL_CLASS(ClassName) \
-%hook ClassName \
-- (void)layoutSubviews { \
-    %orig; \
-    UIImage *custom = getCustomIconForCell(self); \
-    if (custom) { \
-        applyCustomImageToCell(self, custom); \
-    } else { \
-        restoreCell(self); \
-    } \
-} \
+
+%hook UIShareGroupActivityCell
+- (void)layoutSubviews {
+    %orig;
+    UIImage *custom = getCustomIconForCell(self);
+    if (custom) {
+        applyCustomImageToCell(self, custom);
+    } else {
+        restoreCell(self);
+    }
+}
 %end
 
-HOOK_CELL_CLASS(UIShareGroupActivityCell)
-HOOK_CELL_CLASS(UIActivityGroupActivityCell)
-HOOK_CELL_CLASS(UIActivityActionGroupCell)
+%hook UIActivityGroupActivityCell
+- (void)layoutSubviews {
+    %orig;
+    UIImage *custom = getCustomIconForCell(self);
+    if (custom) {
+        applyCustomImageToCell(self, custom);
+    } else {
+        restoreCell(self);
+    }
+}
+%end
+
+%hook UIActivityActionGroupCell
+- (void)layoutSubviews {
+    %orig;
+    UIImage *custom = getCustomIconForCell(self);
+    if (custom) {
+        applyCustomImageToCell(self, custom);
+    } else {
+        restoreCell(self);
+    }
+}
+%end
 
 %ctor {
     loadPrefs();
