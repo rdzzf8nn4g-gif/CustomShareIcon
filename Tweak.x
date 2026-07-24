@@ -13,6 +13,7 @@
 - (void)_updateDarkening;
 - (void)_configureImageViewForPlaceholder:(BOOL)placeholder;
 - (void)csi_applyCustomIcon;
+- (void)csi_forceApplyAfterDelay;
 @end
 
 @interface UIApplicationExtensionActivity : UIActivity
@@ -64,7 +65,7 @@ static void loadPrefs() {
 
     NSLog(@"[CustomShareIcon] loadPrefs enabled=%d count=%lu keys=%@", isEnabled,
           (unsigned long)(customIconsDict ? customIconsDict.count : 0),
-          customIconsDict.allKeys);
+          customIconsDict.allKeys ?: @[]);
 }
 
 static UIImage *getTestRedImage() {
@@ -86,13 +87,17 @@ static UIImage *getCustomIconForID(NSString *identifier) {
     NSString *base64Str = customIconsDict[identifier];
     if (!base64Str) {
         for (NSString *key in customIconsDict) {
-            if (key.length && ([identifier containsString:key] || [key containsString:identifier])) {
+            if (key.length && ([identifier caseInsensitiveCompare:key] == NSOrderedSame ||
+                               [identifier containsString:key] || [key containsString:identifier])) {
                 base64Str = customIconsDict[key];
                 break;
             }
         }
     }
-    if (!base64Str) return nil;
+    if (!base64Str) {
+        NSLog(@"[CustomShareIcon] ❌ 未找到匹配图标 key=%@ 现有keys=%@", identifier, customIconsDict.allKeys);
+        return nil;
+    }
 
     NSData *data = [[NSData alloc] initWithBase64EncodedString:base64Str options:0];
     if (!data) return nil;
@@ -109,18 +114,17 @@ static NSString *extractIdentifier(id proxy) {
     if (!proxy) return nil;
     NSString *result = nil;
 
-    // 1. iOS 16/17 头文件明确属性
+    // iOS 16/17 头文件：applicationBundleIdentifier
     @try {
         if ([proxy respondsToSelector:@selector(applicationBundleIdentifier)]) {
             result = [proxy valueForKey:@"applicationBundleIdentifier"];
             if (result.length) {
-                NSLog(@"[CustomShareIcon] 提取到 applicationBundleIdentifier = %@", result);
+                NSLog(@"[CustomShareIcon] 提取 applicationBundleIdentifier = %@", result);
                 return result;
             }
         }
     } @catch (NSException *e) {}
 
-    // 2. activity 对象
     id activity = nil;
     @try { activity = [proxy valueForKey:@"activity"]; } @catch (NSException *e) {}
 
@@ -129,7 +133,7 @@ static NSString *extractIdentifier(id proxy) {
             if ([activity respondsToSelector:@selector(containingAppBundleIdentifier)]) {
                 result = [activity valueForKey:@"containingAppBundleIdentifier"];
                 if (result.length) {
-                    NSLog(@"[CustomShareIcon] 提取到 containingAppBundleIdentifier = %@", result);
+                    NSLog(@"[CustomShareIcon] 提取 containingAppBundleIdentifier = %@", result);
                     return result;
                 }
             }
@@ -154,14 +158,13 @@ static NSString *extractIdentifier(id proxy) {
             if ([activity respondsToSelector:@selector(activityType)]) {
                 result = [activity valueForKey:@"activityType"];
                 if (result.length) {
-                    NSLog(@"[CustomShareIcon] 提取到 activityType = %@", result);
+                    NSLog(@"[CustomShareIcon] 提取 activityType = %@", result);
                     return result;
                 }
             }
         } @catch (NSException *e) {}
     }
 
-    // 3. 直接从 proxy 拿 activityType
     @try {
         if ([proxy respondsToSelector:@selector(activityType)]) {
             result = [proxy valueForKey:@"activityType"];
@@ -169,10 +172,10 @@ static NSString *extractIdentifier(id proxy) {
         }
     } @catch (NSException *e) {}
 
-    // 4. 最后尝试 description 里找
+    // AirDrop 特殊处理
     @try {
         NSString *desc = [proxy description];
-        if ([desc containsString:@"AirDrop"] || [desc containsString:@"airdrop"]) {
+        if ([desc.lowercaseString containsString:@"airdrop"]) {
             return @"com.apple.AirDrop";
         }
     } @catch (NSException *e) {}
@@ -186,20 +189,14 @@ static BOOL isInShareSheetContext(UIView *view) {
     int depth = 0;
     while (r && depth < 15) {
         NSString *cls = NSStringFromClass([r class]);
-        if ([cls containsString:@"Preferences"] ||
-            [cls containsString:@"PSList"] ||
-            [cls containsString:@"CustomShareIconRoot"] ||
-            [cls containsString:@"PSViewController"]) {
+        if ([cls containsString:@"Preferences"] || [cls containsString:@"PSList"] ||
+            [cls containsString:@"CustomShareIconRoot"] || [cls containsString:@"PSViewController"]) {
             return NO;
         }
-        if ([cls containsString:@"UIActivityViewController"] ||
-            [cls containsString:@"SHSheet"] ||
-            [cls containsString:@"ShareSheet"] ||
-            [cls containsString:@"UIActivityList"] ||
-            [cls containsString:@"_UIHostActivity"] ||
-            [cls containsString:@"UIShareGroup"] ||
-            [cls containsString:@"ActivityGroup"] ||
-            [cls containsString:@"UIActivity"]) {
+        if ([cls containsString:@"UIActivityViewController"] || [cls containsString:@"SHSheet"] ||
+            [cls containsString:@"ShareSheet"] || [cls containsString:@"UIActivityList"] ||
+            [cls containsString:@"_UIHostActivity"] || [cls containsString:@"UIShareGroup"] ||
+            [cls containsString:@"ActivityGroup"] || [cls containsString:@"UIActivity"]) {
             return YES;
         }
         r = [r nextResponder];
@@ -208,23 +205,14 @@ static BOOL isInShareSheetContext(UIView *view) {
     return NO;
 }
 
-#pragma mark - 主面板（完整对应 iOS 14-17 头文件）
+#pragma mark - 主面板（强制 overlay + 全方法覆盖）
 
 %hook UIShareGroupActivityCell
 
 - (void)setActivityProxy:(id)proxy {
     %orig;
     [self csi_applyCustomIcon];
-    // 隔空投送等需要更长等待
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        [self csi_applyCustomIcon];
-    });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        [self csi_applyCustomIcon];
-    });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        [self csi_applyCustomIcon];
-    });
+    [self csi_forceApplyAfterDelay];
 }
 
 - (void)layoutSubviews {
@@ -232,7 +220,6 @@ static BOOL isInShareSheetContext(UIView *view) {
     [self csi_applyCustomIcon];
 }
 
-// iOS 16+ 
 - (void)setImage:(UIImage *)image {
     %orig;
     [self csi_applyCustomIcon];
@@ -248,7 +235,6 @@ static BOOL isInShareSheetContext(UIView *view) {
     [self csi_applyCustomIcon];
 }
 
-// iOS 17
 - (void)_configureImageViewForPlaceholder:(BOOL)placeholder {
     %orig;
     [self csi_applyCustomIcon];
@@ -256,20 +242,25 @@ static BOOL isInShareSheetContext(UIView *view) {
 
 - (void)setHighlighted:(BOOL)highlighted {
     %orig;
-    // 长按后强制重新覆盖
+    // 长按后连续强制重盖（对抗 slot 回写）
+    [self csi_applyCustomIcon];
     dispatch_async(dispatch_get_main_queue(), ^{
         [self csi_applyCustomIcon];
     });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [self csi_applyCustomIcon];
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [self csi_applyCustomIcon];
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [self csi_applyCustomIcon];
     });
 }
 
 - (void)setSelected:(BOOL)selected {
     %orig;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        [self csi_applyCustomIcon];
-    });
+    [self csi_applyCustomIcon];
 }
 
 - (void)prepareForReuse {
@@ -279,6 +270,23 @@ static BOOL isInShareSheetContext(UIView *view) {
         iv.hidden = YES;
         iv.image = nil;
     }
+}
+
+%new
+- (void)csi_forceApplyAfterDelay {
+    // 专门给隔空投送和异步 slot 用
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [self csi_applyCustomIcon];
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [self csi_applyCustomIcon];
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.7 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [self csi_applyCustomIcon];
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [self csi_applyCustomIcon];
+    });
 }
 
 %new
@@ -292,42 +300,28 @@ static BOOL isInShareSheetContext(UIView *view) {
     if (identifier.length) {
         customImage = getCustomIconForID(identifier);
     }
-    // 没匹配到真实图标时用红色（测试路径）
     if (!customImage) {
-        customImage = getTestRedImage();
+        customImage = getTestRedImage();  // 测试兜底
     }
 
-    UIImageView *targetIv = nil;
+    // ========== 强制使用 overlay（对抗 iOS 16/17 slot 回写）==========
     UIView *slotView = [self valueForKey:@"imageSlotView"];
     UIImageView *nativeIv = [self valueForKey:@"activityImageView"];
+    UIView *ref = nil;
 
-    if (nativeIv && [nativeIv isKindOfClass:[UIImageView class]] && !CGRectIsEmpty(nativeIv.frame) && nativeIv.frame.size.width > 10) {
-        targetIv = nativeIv;
-    } else if (slotView) {
-        for (UIView *sub in slotView.subviews) {
-            if ([sub isKindOfClass:[UIImageView class]] && sub.frame.size.width >= 20) {
-                targetIv = (UIImageView *)sub;
-                break;
-            }
-        }
+    if (nativeIv && !CGRectIsEmpty(nativeIv.frame) && nativeIv.frame.size.width > 10) {
+        ref = nativeIv;
+    } else if (slotView && !CGRectIsEmpty(slotView.frame)) {
+        ref = slotView;
     }
+    if (!ref) return;
 
-    // 优先改原生
-    if (targetIv) {
-        targetIv.image = customImage;
-        targetIv.contentMode = UIViewContentModeScaleAspectFit;
-        targetIv.clipsToBounds = YES;
-        targetIv.hidden = NO;
-        targetIv.alpha = 1.0;
-
-        UIImageView *old = [self.contentView viewWithTag:TAG_CUSTOM_ICON];
-        if (old) old.hidden = YES;
-        return;
+    // 隐藏原生（防止 slot 回写后露出来）
+    if (nativeIv) {
+        nativeIv.hidden = YES;
+        nativeIv.alpha = 0;
     }
-
-    // 兜底 overlay
-    UIView *ref = targetIv ?: slotView ?: nativeIv;
-    if (!ref || CGRectIsEmpty(ref.frame)) return;
+    // 不隐藏整个 slotView，避免布局错位
 
     UIImageView *customIv = [self.contentView viewWithTag:TAG_CUSTOM_ICON];
     if (!customIv) {
@@ -349,6 +343,7 @@ static BOOL isInShareSheetContext(UIView *view) {
 
     [self.contentView bringSubviewToFront:customIv];
 
+    // badge 置顶
     for (UIView *sub in self.contentView.subviews) {
         NSString *n = NSStringFromClass([sub class]).lowercaseString;
         if ([n containsString:@"badge"] || [n containsString:@"dot"]) {
@@ -380,9 +375,8 @@ static BOOL isInShareSheetContext(UIView *view) {
     }
     if (!targetIv) return;
 
-    targetIv.image = getTestRedImage();
-    targetIv.contentMode = UIViewContentModeScaleAspectFit;
-    targetIv.clipsToBounds = YES;
+    targetIv.hidden = YES;
+    targetIv.alpha = 0;
 
     UIImageView *customIv = [self.contentView viewWithTag:TAG_CUSTOM_ICON];
     if (!customIv) {
@@ -456,7 +450,7 @@ static BOOL isInShareSheetContext(UIView *view) {
 %end
 
 %ctor {
-    NSLog(@"[CustomShareIcon] Tweak 加载完成 (iOS17 + 长按/隔空投送强化版)");
+    NSLog(@"[CustomShareIcon] Tweak 加载完成 (强制overlay + 对抗slot回写版)");
     loadPrefs();
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
                                     NULL, (CFNotificationCallback)loadPrefs,
