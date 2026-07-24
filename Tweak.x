@@ -7,6 +7,31 @@
 #endif
 
 // =======================
+// 声明要 Hook 的私有类，避免编译器找不到类型
+// =======================
+@interface UIShareGroupActivityCell : UICollectionViewCell
+- (id)activityProxy;
+- (UIImageView *)activityImageView;
+@end
+
+@interface UIActivityGroupActivityCell : UICollectionViewCell
+- (id)activityProxy;
+- (UIImageView *)activityImageView;
+@end
+
+@interface UIActivityActionGroupCell : UICollectionViewCell
+- (id)activityProxy;
+- (UIImageView *)activityImageView;
+@end
+
+@protocol CSIActivityProtocol <NSObject>
+@optional
+- (NSString *)containingAppBundleIdentifier;
+- (NSString *)activityType;
+@end
+
+
+// =======================
 // 通用定义与沙盒穿透路径
 // =======================
 static NSString * GetMediaDir() {
@@ -36,12 +61,11 @@ static NSString * GetPrefPath() {
 static BOOL isEnabled = NO;
 
 static void loadPrefs() {
-    // 强制使用字典读取，避免 CFPreferences 在某些高限制沙盒中失败
     NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:GetPrefPath()];
     isEnabled = dict[@"Enabled"] ? [dict[@"Enabled"] boolValue] : NO;
 }
 
-// 核心查找图片：支持前缀匹配 (应对 com.tencent.xin.shareextension)
+// 核心查找图片：支持前缀匹配
 static UIImage *getCustomIconForID(NSString *identifier) {
     if (!identifier || identifier.length == 0) return nil;
     NSString *dir = GetMediaDir();
@@ -66,15 +90,12 @@ static UIImage *getCustomIconForID(NSString *identifier) {
     return nil;
 }
 
-// =======================
-// Cell UI 层拦截模块 (无视任何缓存，直接干预视图)
-// =======================
-static void handleCellUpdate(id cell) {
-    if (!isEnabled) return;
-    if (![cell respondsToSelector:@selector(activityProxy)]) return;
+static UIImage *getCustomIconForCell(id cell) {
+    if (!isEnabled) return nil;
+    if (![cell respondsToSelector:@selector(activityProxy)]) return nil;
     
     id proxy = [cell performSelector:@selector(activityProxy)];
-    if (!proxy) return;
+    if (!proxy) return nil;
     
     NSString *actType = nil;
     if ([proxy respondsToSelector:NSSelectorFromString(@"activityType")]) {
@@ -82,61 +103,89 @@ static void handleCellUpdate(id cell) {
     }
     
     if (actType) {
-        UIImage *custom = getCustomIconForID(actType);
-        if (custom) {
-            if ([cell respondsToSelector:@selector(activityImageView)]) {
-                UIImageView *iv = [cell performSelector:@selector(activityImageView)];
-                if (iv && [iv isKindOfClass:[UIImageView class]]) {
-                    iv.image = custom; // 强行替换
-                }
+        return getCustomIconForID(actType);
+    }
+    return nil;
+}
+
+static void handleCellUpdate(id cell) {
+    UIImage *custom = getCustomIconForCell(cell);
+    if (custom) {
+        if ([cell respondsToSelector:@selector(activityImageView)]) {
+            UIImageView *iv = [cell performSelector:@selector(activityImageView)];
+            if (iv && [iv isKindOfClass:[UIImageView class]]) {
+                iv.image = custom; // 强行替换视图
             }
         }
     }
 }
 
-// 宏定义：批量 Hook 各个 iOS 版本的 Cell 渲染类
-#define HOOK_SHARE_CELL(CellClass) \
-%hook CellClass \
-- (void)setImage:(UIImage *)img { \
-    if (isEnabled) { \
-        id proxy = [self respondsToSelector:@selector(activityProxy)] ? [self performSelector:@selector(activityProxy)] : nil; \
-        NSString *actType = proxy && [proxy respondsToSelector:NSSelectorFromString(@"activityType")] ? [proxy valueForKey:@"activityType"] : nil; \
-        if (actType) { \
-            UIImage *custom = getCustomIconForID(actType); \
-            if (custom) { \
-                %orig(custom); \
-                return; \
-            } \
-        } \
-    } \
-    %orig(img); \
-} \
-- (void)_updateImageView { \
-    %orig; \
-    handleCellUpdate(self); \
-} \
-- (void)layoutSubviews { \
-    %orig; \
-    handleCellUpdate(self); \
-} \
+
+// =======================
+// Cell UI 层拦截模块 (手动展开宏，完美兼容 Logos 编译器)
+// =======================
+
+%hook UIShareGroupActivityCell
+- (void)setImage:(UIImage *)img {
+    UIImage *custom = getCustomIconForCell(self);
+    if (custom) {
+        %orig(custom);
+        return;
+    }
+    %orig(img);
+}
+- (void)_updateImageView {
+    %orig;
+    handleCellUpdate(self);
+}
+- (void)layoutSubviews {
+    %orig;
+    handleCellUpdate(self);
+}
 %end
 
-// 针对 iOS 16-17 的 App 列表
-HOOK_SHARE_CELL(UIShareGroupActivityCell)
-// 针对 iOS 14-15 的 App 列表
-HOOK_SHARE_CELL(UIActivityGroupActivityCell)
-// 针对 iOS 14-17 的 动作(复制、Safari打开等) 列表
-HOOK_SHARE_CELL(UIActivityActionGroupCell)
+%hook UIActivityGroupActivityCell
+- (void)setImage:(UIImage *)img {
+    UIImage *custom = getCustomIconForCell(self);
+    if (custom) {
+        %orig(custom);
+        return;
+    }
+    %orig(img);
+}
+- (void)_updateImageView {
+    %orig;
+    handleCellUpdate(self);
+}
+- (void)layoutSubviews {
+    %orig;
+    handleCellUpdate(self);
+}
+%end
+
+%hook UIActivityActionGroupCell
+- (void)setImage:(UIImage *)img {
+    UIImage *custom = getCustomIconForCell(self);
+    if (custom) {
+        %orig(custom);
+        return;
+    }
+    %orig(img);
+}
+- (void)_updateImageView {
+    %orig;
+    handleCellUpdate(self);
+}
+- (void)layoutSubviews {
+    %orig;
+    handleCellUpdate(self);
+}
+%end
 
 
 // =======================
-// 数据源层拦截模块 (备用，用于兜底某些原生功能)
+// 数据源层拦截模块 (备用，兜底原生功能)
 // =======================
-@protocol CSIActivityProtocol <NSObject>
-@optional
-- (NSString *)containingAppBundleIdentifier;
-- (NSString *)activityType;
-@end
 
 static NSString *getIdentifierForActivity(id<CSIActivityProtocol> activity) {
     NSString *identifier = nil;
@@ -175,7 +224,7 @@ static NSString *getIdentifierForActivity(id<CSIActivityProtocol> activity) {
 }
 - (NSString *)_systemImageName {
     if (isEnabled && getCustomIconForID(getIdentifierForActivity((id<CSIActivityProtocol>)self))) {
-        return nil; // 强行废掉系统图标 fallback
+        return nil; // 废掉原生 SF Symbol fallback
     }
     return %orig;
 }
