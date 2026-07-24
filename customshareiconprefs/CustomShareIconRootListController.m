@@ -7,9 +7,6 @@
 #define jbroot(path) path
 #endif
 
-// =======================
-// 直接物理文件路径，赋予最高读写权
-// =======================
 static NSString * GetPrefPath() {
     NSString *base = @"/var/mobile/Library/Preferences/com.iosdump.customshareicon.plist";
 #if __has_include(<roothide.h>)
@@ -32,7 +29,6 @@ static NSString * GetPrefPath() {
     if (!_specifiers) {
         NSMutableArray *specs = [[self loadSpecifiersFromPlistName:@"Root" target:self] mutableCopy];
         
-        // 直接读取物理文件
         NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:GetPrefPath()];
         NSDictionary *icons = dict[@"CustomIcons"];
         
@@ -78,7 +74,6 @@ static NSString * GetPrefPath() {
     }];
     
     UIAlertAction *cancel = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
-    
     [alert addAction:confirm];
     [alert addAction:cancel];
     
@@ -96,7 +91,6 @@ static NSString * GetPrefPath() {
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"删除图标" message:[NSString stringWithFormat:@"确定要删除 %@ 吗？", bundleID] preferredStyle:UIAlertControllerStyleAlert];
     
     [alert addAction:[UIAlertAction actionWithTitle:@"删除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
-        
         NSString *prefPath = GetPrefPath();
         NSMutableDictionary *dict = [NSMutableDictionary dictionaryWithContentsOfFile:prefPath] ?: [NSMutableDictionary dictionary];
         NSMutableDictionary *icons = [dict[@"CustomIcons"] mutableCopy] ?: [NSMutableDictionary dictionary];
@@ -134,9 +128,6 @@ static NSString * GetPrefPath() {
     });
 }
 
-// =======================
-// 核心：图片智能压缩 + Base64 直写，无视沙盒读写限制
-// =======================
 - (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results {
     if (results.count == 0 || !self.pendingBundleID) {
         [picker dismissViewControllerAnimated:YES completion:nil];
@@ -150,7 +141,6 @@ static NSString * GetPrefPath() {
                 if ([object isKindOfClass:[UIImage class]]) {
                     UIImage *img = (UIImage *)object;
                     
-                    // 智能缩放：将任意大图缩放到最大 120x120，极大降低 Base64 体积，防止撑爆进程内存
                     CGSize size = img.size;
                     CGFloat ratio = MIN(120.0/size.width, 120.0/size.height);
                     if (ratio < 1.0) {
@@ -174,7 +164,6 @@ static NSString * GetPrefPath() {
                     BOOL success = [dict writeToFile:prefPath atomically:YES];
                     if (success) {
                         [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions: @0777, NSFileProtectionKey: NSFileProtectionNone} ofItemAtPath:prefPath error:nil];
-                        
                         dispatch_async(dispatch_get_main_queue(), ^{
                             [self reloadSpecifiers];
                             CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(), CFSTR("com.iosdump.customshareicon/ReloadPrefs"), NULL, NULL, YES);
