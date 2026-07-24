@@ -9,17 +9,6 @@
     [super viewDidLoad];
 }
 
-- (void)fixPermissions {
-    NSString *rootfulPath = @"/var/mobile/Library/Preferences/com.iosdump.customshareicon.plist";
-    NSString *rootlessPath = @"/var/jb/var/mobile/Library/Preferences/com.iosdump.customshareicon.plist";
-    
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSDictionary *attr = @{ NSFilePosixPermissions: @0644 };
-    
-    if ([fm fileExistsAtPath:rootfulPath]) [fm setAttributes:attr ofItemAtPath:rootfulPath error:nil];
-    if ([fm fileExistsAtPath:rootlessPath]) [fm setAttributes:attr ofItemAtPath:rootlessPath error:nil];
-}
-
 - (NSDictionary *)getIconsDict {
     CFPropertyListRef val = CFPreferencesCopyAppValue(CFSTR("IOSDump_CSI_Icons"), PREFS_DOMAIN);
     NSDictionary *dict = nil;
@@ -33,7 +22,6 @@
 - (void)saveIconsDict:(NSDictionary *)icons {
     CFPreferencesSetAppValue(CFSTR("IOSDump_CSI_Icons"), (__bridge CFDictionaryRef)icons, PREFS_DOMAIN);
     CFPreferencesAppSynchronize(PREFS_DOMAIN);
-    [self fixPermissions];
     CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
                                          CFSTR("com.iosdump.customshareicon/ReloadPrefs"),
                                          NULL, NULL, YES);
@@ -46,7 +34,7 @@
 
         if (icons.count > 0) {
             PSSpecifier *group = [PSSpecifier preferenceSpecifierNamed:@"已配置的图标 (点击删除)"
-                                                                target:self set:nil get:nil detail:Nil cell:PSGroupCell edit:Nil];
+                                                               target:self set:nil get:nil detail:Nil cell:PSGroupCell edit:Nil];
             [specs addObject:group];
 
             for (NSString *bundleID in icons.allKeys) {
@@ -203,7 +191,6 @@
     if ([key isEqualToString:@"Enabled"]) {
         CFPreferencesSetAppValue(CFSTR("Enabled"), (__bridge CFPropertyListRef)value, PREFS_DOMAIN);
         CFPreferencesAppSynchronize(PREFS_DOMAIN);
-        [self fixPermissions];
         CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
                                              CFSTR("com.iosdump.customshareicon/ReloadPrefs"),
                                              NULL, NULL, YES);
