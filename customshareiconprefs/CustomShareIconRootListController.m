@@ -7,6 +7,9 @@
 #define jbroot(path) path
 #endif
 
+// =======================
+// 辅助函数：获取图片存储目录
+// =======================
 static NSString * GetCSIDir() {
     NSString *base = @"/var/mobile/Library/Preferences/com.iosdump.customshareicon.media";
 #if __has_include(<roothide.h>)
@@ -19,12 +22,30 @@ static NSString * GetCSIDir() {
 #endif
 }
 
+// =======================
+// 辅助函数：获取 plist 配置文件路径
+// =======================
+static NSString * GetPrefPath() {
+    NSString *base = @"/var/mobile/Library/Preferences/com.iosdump.customshareicon.plist";
+#if __has_include(<roothide.h>)
+    return jbroot(base);
+#else
+    if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/jb/"]) {
+        return [@"/var/jb" stringByAppendingPathComponent:base];
+    }
+    return base;
+#endif
+}
+
+
 @implementation CustomShareIconRootListController
 
 - (void)viewDidLoad {
     [super viewDidLoad];
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *dir = GetCSIDir();
+    
+    // 如果文件夹不存在，则创建并赋予 0777 权限
     if (![fm fileExistsAtPath:dir]) {
         [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:@{NSFilePosixPermissions: @0777, NSFileProtectionKey: NSFileProtectionNone} error:nil];
     } else {
@@ -69,7 +90,9 @@ static NSString * GetCSIDir() {
         [[UIApplication sharedApplication] openURL:url options:@{} completionHandler:nil];
     }
 }
-- (void)openTelegramChannel:(PSSpecifier *)spec { [self openTelegramChannel]; }
+- (void)openTelegramChannel:(PSSpecifier *)spec { 
+    [self openTelegramChannel]; 
+}
 
 - (void)addNewIcon {
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"添加自定义图标" message:@"请输入目标App的Bundle ID\n(例如微信：com.tencent.xin)" preferredStyle:UIAlertControllerStyleAlert];
@@ -97,7 +120,9 @@ static NSString * GetCSIDir() {
     [topVC presentViewController:alert animated:YES completion:nil];
 }
 
-- (void)addNewIcon:(PSSpecifier *)spec { [self addNewIcon]; }
+- (void)addNewIcon:(PSSpecifier *)spec { 
+    [self addNewIcon]; 
+}
 
 - (void)deleteIcon:(PSSpecifier *)spec {
     NSString *filename = [spec propertyForKey:@"filename"];
@@ -152,6 +177,8 @@ static NSString * GetCSIDir() {
                     NSData *data = UIImagePNGRepresentation(img);
                     NSString *path = [GetCSIDir() stringByAppendingPathComponent:[NSString stringWithFormat:@"%@.png", self.pendingBundleID]];
                     [data writeToFile:path atomically:YES];
+                    
+                    // 核心：强制赋予图片 0777 权限，穿透 ShareSheet 沙盒
                     [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions: @0777, NSFileProtectionKey: NSFileProtectionNone} ofItemAtPath:path error:nil];
                     
                     dispatch_async(dispatch_get_main_queue(), ^{
@@ -188,6 +215,9 @@ static NSString * GetCSIDir() {
     return cell;
 }
 
+// =======================
+// 设置值并修复权限，穿透 ShareUIService 的严格沙盒
+// =======================
 - (void)setPreferenceValue:(id)value specifier:(PSSpecifier *)specifier {
     [super setPreferenceValue:value specifier:specifier];
     if ([specifier.identifier isEqualToString:@"Enabled"]) {
