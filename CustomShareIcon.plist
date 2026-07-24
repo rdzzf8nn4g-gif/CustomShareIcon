@@ -8,12 +8,6 @@
         <array>
             <string>com.apple.UIKit</string>
             <string>com.apple.UIKitCore</string>
-            <string>com.apple.ShareSheet</string>
-            <string>com.apple.SharingUI</string>
-            <string>com.apple.sharing.ShareUIService</string>
-            <string>com.apple.ShareUIService</string>
-            <string>com.apple.SharingViewService</string>
-            <string>com.apple.springboard</string>
         </array>
     </dict>
 </dict>
