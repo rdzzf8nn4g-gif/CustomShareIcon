@@ -5,7 +5,7 @@
 #define PREFS_DOMAIN CFSTR("com.iosdump.customshareicon")
 
 // =======================
-// 完整接口声明（解决所有 forward declaration 错误）
+// 完整接口声明（解决所有编译错误）
 // =======================
 @interface UIShareGroupActivityCell : UICollectionViewCell
 @property (nonatomic, strong) id activityProxy;
@@ -13,6 +13,7 @@
 - (void)setImage:(UIImage *)image;
 - (void)_updateImageView;
 - (void)_configureImageViewForPlaceholder:(_Bool)placeholder;
+- (void)csi_applyCustomIconWithDelay:(BOOL)needDelay;   // %new 方法必须声明
 @end
 
 @interface UIApplicationExtensionActivity : UIActivity
