@@ -1,7 +1,7 @@
 #import "CustomShareIconRootListController.h"
 #import <Preferences/PSSpecifier.h>
 
-#define PREFS_ID @"com.iosdump.customshareicon"
+#define PREFS_DOMAIN CFSTR("com.iosdump.customshareicon")
 
 @implementation CustomShareIconRootListController
 
@@ -9,23 +9,19 @@
     [super viewDidLoad];
 }
 
-- (NSUserDefaults *)prefs {
-    static NSUserDefaults *prefs = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        prefs = [[NSUserDefaults alloc] initWithSuiteName:PREFS_ID];
-    });
-    return prefs;
-}
-
 - (NSDictionary *)getIconsDict {
-    id val = [[self prefs] objectForKey:@"IOSDump_CSI_Icons"];
-    return [val isKindOfClass:[NSDictionary class]] ? val : @{};
+    CFPropertyListRef val = CFPreferencesCopyAppValue(CFSTR("IOSDump_CSI_Icons"), PREFS_DOMAIN);
+    NSDictionary *dict = nil;
+    if (val && CFGetTypeID(val) == CFDictionaryGetTypeID()) {
+        dict = [(__bridge NSDictionary *)val copy];
+    }
+    if (val) CFRelease(val);
+    return dict ?: @{};
 }
 
 - (void)saveIconsDict:(NSDictionary *)icons {
-    [[self prefs] setObject:icons forKey:@"IOSDump_CSI_Icons"];
-    [[self prefs] synchronize];
+    CFPreferencesSetAppValue(CFSTR("IOSDump_CSI_Icons"), (__bridge CFDictionaryRef)icons, PREFS_DOMAIN);
+    CFPreferencesAppSynchronize(PREFS_DOMAIN);
     CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
                                          CFSTR("com.iosdump.customshareicon/ReloadPrefs"),
                                          NULL, NULL, YES);
@@ -38,22 +34,12 @@
 
         if (icons.count > 0) {
             PSSpecifier *group = [PSSpecifier preferenceSpecifierNamed:@"已配置的图标 (点击删除)"
-                                                               target:self
-                                                                  set:nil
-                                                                  get:nil
-                                                               detail:Nil
-                                                                 cell:PSGroupCell
-                                                                 edit:Nil];
+                                                               target:self set:nil get:nil detail:Nil cell:PSGroupCell edit:Nil];
             [specs addObject:group];
 
             for (NSString *bundleID in icons.allKeys) {
                 PSSpecifier *spec = [PSSpecifier preferenceSpecifierNamed:bundleID
-                                                                   target:self
-                                                                      set:nil
-                                                                      get:nil
-                                                                   detail:Nil
-                                                                     cell:PSButtonCell
-                                                                     edit:Nil];
+                                                                   target:self set:nil get:nil detail:Nil cell:PSButtonCell edit:Nil];
                 spec.identifier = bundleID;
                 [spec setProperty:bundleID forKey:@"bundleID"];
                 [spec setProperty:NSStringFromSelector(@selector(deleteIcon:)) forKey:@"action"];
@@ -78,19 +64,17 @@
                                                                    message:@"请输入目标App的Bundle ID\n(例如微信：com.tencent.xin)"
                                                             preferredStyle:UIAlertControllerStyleAlert];
 
-    [alert addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull textField) {
+    [alert addTextFieldWithConfigurationHandler:^(UITextField *textField) {
         textField.placeholder = @"例如：com.tencent.xin";
     }];
 
-    UIAlertAction *confirm = [UIAlertAction actionWithTitle:@"下一步(选图)" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
+    [alert addAction:[UIAlertAction actionWithTitle:@"下一步(选图)" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
         NSString *input = alert.textFields.firstObject.text;
         if (input.length > 0) {
             self.pendingBundleID = input;
             [self presentMediaPicker];
         }
-    }];
-
-    [alert addAction:confirm];
+    }]];
     [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
 
     UIViewController *topVC = self.view.window.rootViewController ?: self;
@@ -106,7 +90,7 @@
                                                                    message:[NSString stringWithFormat:@"确定要删除 %@ 吗？", bundleID]
                                                             preferredStyle:UIAlertControllerStyleAlert];
 
-    [alert addAction:[UIAlertAction actionWithTitle:@"删除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction * _Nonnull action) {
+    [alert addAction:[UIAlertAction actionWithTitle:@"删除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
         NSMutableDictionary *icons = [[self getIconsDict] mutableCopy];
         [icons removeObjectForKey:bundleID];
         [self saveIconsDict:icons];
@@ -200,14 +184,13 @@
     return cell;
 }
 
-// 关键：用 key 判断，而不是 identifier
 - (void)setPreferenceValue:(id)value specifier:(PSSpecifier *)specifier {
     [super setPreferenceValue:value specifier:specifier];
 
     NSString *key = [specifier propertyForKey:@"key"];
     if ([key isEqualToString:@"Enabled"]) {
-        [[self prefs] setObject:value forKey:@"Enabled"];
-        [[self prefs] synchronize];
+        CFPreferencesSetAppValue(CFSTR("Enabled"), (__bridge CFPropertyListRef)value, PREFS_DOMAIN);
+        CFPreferencesAppSynchronize(PREFS_DOMAIN);
         CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
                                              CFSTR("com.iosdump.customshareicon/ReloadPrefs"),
                                              NULL, NULL, YES);
