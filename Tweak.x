@@ -7,28 +7,12 @@
 @interface UIShareGroupActivityCell : UICollectionViewCell
 @property (nonatomic, strong) id activityProxy;
 - (void)setActivityProxy:(id)proxy;
-- (void)csi_applyCustomIcon;
-@end
-
-@interface UIApplicationExtensionActivity : UIActivity
-- (NSString *)containingAppBundleIdentifier;
-- (NSString *)activityType;
-- (UIImage *)_activityImage;
-@end
-
-@interface UIActivity (CustomShareIcon)
-+ (id)_activityImageForApplicationBundleIdentifier:(NSString *)identifier;
-+ (id)_activityImageForBundleImageConfiguration:(id)configuration;
-- (UIImage *)activityImage;
-- (UIImage *)_activityImage;
-- (NSString *)_systemImageName;
-- (NSString *)activityType;
+- (void)csi_forceRed;
 @end
 
 static BOOL isEnabled = NO;
 static NSDictionary *customIconsDict = nil;
-static NSMutableDictionary<NSString *, UIImage *> *imageCache = nil;
-static UIImage *testRedImage = nil;   // 懒加载，绝不在 %ctor 里创建
+static UIImage *testRedImage = nil;
 
 static void loadPrefs() {
     CFPreferencesAppSynchronize(PREFS_DOMAIN);
@@ -45,238 +29,99 @@ static void loadPrefs() {
     }
     if (iconsRef) CFRelease(iconsRef);
 
-    if (!imageCache) {
-        imageCache = [[NSMutableDictionary alloc] init];
-    } else {
-        [imageCache removeAllObjects];
-    }
-
     NSLog(@"[CustomShareIcon] loadPrefs enabled=%d count=%lu", isEnabled, (unsigned long)(customIconsDict ? customIconsDict.count : 0));
 }
 
-// 懒加载红色测试图（只在真正需要时、主线程创建）
 static UIImage *getTestRedImage() {
     if (testRedImage) return testRedImage;
-
-    // 使用固定 scale，避免依赖 UIScreen
     UIGraphicsBeginImageContextWithOptions(CGSizeMake(60, 60), NO, 3.0);
     [[UIColor redColor] setFill];
     UIRectFill(CGRectMake(0, 0, 60, 60));
+    [[UIColor whiteColor] setStroke];
+    UIBezierPath *path = [UIBezierPath bezierPathWithRect:CGRectMake(2, 2, 56, 56)];
+    path.lineWidth = 4;
+    [path stroke];
     testRedImage = UIGraphicsGetImageFromCurrentImageContext();
     UIGraphicsEndImageContext();
-
     return testRedImage;
 }
 
-static UIImage *getCustomIconForID(NSString *identifier) {
-    if (!isEnabled || !identifier.length || !customIconsDict) return nil;
-
-    if (imageCache[identifier]) return imageCache[identifier];
-
-    NSString *base64Str = customIconsDict[identifier];
-    if (!base64Str) {
-        for (NSString *key in customIconsDict) {
-            if (key.length && ([identifier containsString:key] || [key containsString:identifier])) {
-                base64Str = customIconsDict[key];
-                break;
-            }
-        }
+// 递归把所有 UIImageView 的图片强制换成红色（暴力测试）
+static void forceRedOnAllImageViews(UIView *view) {
+    if ([view isKindOfClass:[UIImageView class]]) {
+        UIImageView *iv = (UIImageView *)view;
+        iv.image = getTestRedImage();
+        iv.hidden = NO;
+        iv.alpha = 1.0;
+        iv.backgroundColor = [UIColor redColor];
     }
-    if (!base64Str) return nil;
-
-    NSData *data = [[NSData alloc] initWithBase64EncodedString:base64Str options:0];
-    if (!data) return nil;
-
-    UIImage *img = [UIImage imageWithData:data scale:3.0]; // 固定 scale，安全
-    if (img) {
-        imageCache[identifier] = img;
-        NSLog(@"[CustomShareIcon] 加载成功 → %@", identifier);
+    for (UIView *sub in view.subviews) {
+        forceRedOnAllImageViews(sub);
     }
-    return img;
-}
-
-static NSString *extractIdentifier(id proxy) {
-    if (!proxy) return nil;
-    NSString *result = nil;
-
-    // iOS 16+
-    if ([proxy respondsToSelector:@selector(applicationBundleIdentifier)]) {
-        result = [proxy valueForKey:@"applicationBundleIdentifier"];
-        if (result.length) return result;
-    }
-
-    // iOS 14 头文件里的 activity 属性
-    id activity = nil;
-    @try {
-        activity = [proxy valueForKey:@"activity"];
-    } @catch (NSException *e) {}
-
-    if (activity) {
-        if ([activity respondsToSelector:@selector(containingAppBundleIdentifier)]) {
-            result = [activity valueForKey:@"containingAppBundleIdentifier"];
-            if (result.length) return result;
-        }
-        if ([activity respondsToSelector:@selector(applicationExtension)]) {
-            id ext = [activity valueForKey:@"applicationExtension"];
-            if (ext) {
-                result = [ext valueForKey:@"identifier"];
-                if (result.length) return result;
-                id bundle = [ext valueForKey:@"_bundle"];
-                if (bundle) {
-                    result = [bundle bundleIdentifier];
-                    if (result.length) return result;
-                }
-            }
-        }
-        if ([activity respondsToSelector:@selector(activityType)]) {
-            result = [activity valueForKey:@"activityType"];
-            if (result.length) return result;
-        }
-    }
-
-    if ([proxy respondsToSelector:@selector(activityType)]) {
-        result = [proxy valueForKey:@"activityType"];
-        if (result.length) return result;
-    }
-    return nil;
 }
 
 %hook UIShareGroupActivityCell
 
 - (void)setActivityProxy:(id)proxy {
     %orig;
-    [self csi_applyCustomIcon];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        [self csi_applyCustomIcon];
+    NSLog(@"[CustomShareIcon] setActivityProxy 被调用 class=%@ proxy=%@", NSStringFromClass([self class]), proxy);
+    [self csi_forceRed];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [self csi_forceRed];
     });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        [self csi_applyCustomIcon];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [self csi_forceRed];
     });
 }
 
 - (void)layoutSubviews {
     %orig;
-    [self csi_applyCustomIcon];
+    [self csi_forceRed];
 }
 
 - (void)prepareForReuse {
     %orig;
-    UIImageView *customIv = [self.contentView viewWithTag:TAG_CUSTOM_ICON];
-    if (customIv) {
-        customIv.hidden = YES;
-        customIv.image = nil;
-    }
+    UIView *v = [self viewWithTag:TAG_CUSTOM_ICON];
+    if (v) v.hidden = YES;
 }
 
 %new
-- (void)csi_applyCustomIcon {
+- (void)csi_forceRed {
     if (!isEnabled) return;
 
-    __weak typeof(self) weakSelf = self;
-    __strong typeof(weakSelf) strongSelf = weakSelf;
-    if (!strongSelf) return;
+    // 1. 暴力把所有现有 UIImageView 换成红色
+    forceRedOnAllImageViews(self);
 
-    id proxy = [strongSelf valueForKey:@"activityProxy"];
-    NSString *identifier = extractIdentifier(proxy);
-
-    UIImage *customImage = nil;
-    if (identifier.length) {
-        customImage = getCustomIconForID(identifier);
-        NSLog(@"[CustomShareIcon] identifier=%@ custom=%@", identifier, customImage ? @"YES" : @"NO");
-    } else {
-        NSLog(@"[CustomShareIcon] 提取失败，使用红色测试图 proxy=%@", proxy);
-    }
-
-    // 没匹配到就用红色测试图（懒加载，安全）
-    if (!customImage) {
-        customImage = getTestRedImage();
-    }
-
-    UIView *slotView = [strongSelf valueForKey:@"imageSlotView"];
-    UIImageView *nativeIv = [strongSelf valueForKey:@"activityImageView"];
-    UIImageView *customIv = [strongSelf.contentView viewWithTag:TAG_CUSTOM_ICON];
-
-    // 隐藏原生
-    if (slotView) {
-        slotView.hidden = YES;
-        slotView.alpha = 0;
-    }
-    if (nativeIv) {
-        nativeIv.hidden = YES;
-        nativeIv.alpha = 0;
-    }
-
+    // 2. 自己再强制盖一层红色方块（不依赖任何私有属性）
+    UIImageView *customIv = [self viewWithTag:TAG_CUSTOM_ICON];
     if (!customIv) {
-        customIv = [UIImageView new];
+        customIv = [[UIImageView alloc] init];
         customIv.tag = TAG_CUSTOM_ICON;
         customIv.contentMode = UIViewContentModeScaleAspectFit;
         customIv.clipsToBounds = YES;
-        [strongSelf.contentView addSubview:customIv];
+        customIv.layer.cornerRadius = 13;
+        customIv.backgroundColor = [UIColor redColor];
+        [self addSubview:customIv];   // 直接加到 cell 上，不依赖 contentView
     }
 
-    [strongSelf.contentView bringSubviewToFront:customIv];
-
-    UIView *ref = (nativeIv && !CGRectIsEmpty(nativeIv.frame)) ? nativeIv : slotView;
-    if (ref && !CGRectIsEmpty(ref.frame)) {
-        customIv.frame = ref.frame;
-        customIv.layer.cornerRadius = ref.layer.cornerRadius > 0 ? ref.layer.cornerRadius : 13.0;
-    } else {
-        customIv.frame = CGRectMake((strongSelf.contentView.bounds.size.width - 60)/2.0, 0, 60, 60);
-        customIv.layer.cornerRadius = 13.0;
-    }
-
-    customIv.image = customImage;
+    // 强制放在中间，尺寸固定
+    CGFloat size = 58;
+    customIv.frame = CGRectMake((self.bounds.size.width - size) / 2.0,
+                                4,
+                                size, size);
+    customIv.image = getTestRedImage();
     customIv.hidden = NO;
     customIv.alpha = 1.0;
-}
+    [self bringSubviewToFront:customIv];
 
-%end
-
-%hook UIActivity
-
-+ (id)_activityImageForApplicationBundleIdentifier:(NSString *)identifier {
-    UIImage *custom = getCustomIconForID(identifier);
-    return custom ?: %orig;
-}
-
-- (UIImage *)activityImage {
-    NSString *type = [self respondsToSelector:@selector(activityType)] ? [self activityType] : nil;
-    UIImage *custom = getCustomIconForID(type);
-    return custom ?: %orig;
-}
-
-- (UIImage *)_activityImage {
-    NSString *type = [self respondsToSelector:@selector(activityType)] ? [self activityType] : nil;
-    UIImage *custom = getCustomIconForID(type);
-    return custom ?: %orig;
-}
-
-- (NSString *)_systemImageName {
-    NSString *type = [self respondsToSelector:@selector(activityType)] ? [self activityType] : nil;
-    if (getCustomIconForID(type)) return nil;
-    return %orig;
-}
-
-%end
-
-%hook UIApplicationExtensionActivity
-
-- (UIImage *)_activityImage {
-    NSString *bid = nil;
-    if ([self respondsToSelector:@selector(containingAppBundleIdentifier)]) {
-        bid = [self containingAppBundleIdentifier];
-    }
-    if (!bid.length && [self respondsToSelector:@selector(activityType)]) {
-        bid = [self activityType];
-    }
-    UIImage *custom = getCustomIconForID(bid);
-    return custom ?: %orig;
+    NSLog(@"[CustomShareIcon] 强制红色已执行 bounds=%.0fx%.0f subviews=%lu",
+          self.bounds.size.width, self.bounds.size.height, (unsigned long)self.subviews.count);
 }
 
 %end
 
 %ctor {
-    NSLog(@"[CustomShareIcon] Tweak 加载完成 (安全懒加载红色测试版)");
+    NSLog(@"[CustomShareIcon] Tweak 加载完成 (iOS14 暴力红色测试版)");
     loadPrefs();
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
                                     NULL, (CFNotificationCallback)loadPrefs,
