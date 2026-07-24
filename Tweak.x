@@ -4,6 +4,31 @@
 #define TAG_CUSTOM_ICON 998877
 #define PREFS_DOMAIN CFSTR("com.iosdump.customshareicon")
 
+// =======================
+// 完整接口声明（解决所有 forward declaration 错误）
+// =======================
+@interface UIShareGroupActivityCell : UICollectionViewCell
+@property (nonatomic, strong) id activityProxy;
+- (void)setActivityProxy:(id)proxy;
+- (void)setImage:(UIImage *)image;
+- (void)_updateImageView;
+- (void)_configureImageViewForPlaceholder:(_Bool)placeholder;
+@end
+
+@interface UIApplicationExtensionActivity : UIActivity
+- (NSString *)containingAppBundleIdentifier;
+- (NSString *)activityType;
+- (UIImage *)_activityImage;
+@end
+
+@interface UIActivity (CustomShareIcon)
++ (id)_activityImageForApplicationBundleIdentifier:(NSString *)identifier;
+- (UIImage *)activityImage;
+- (UIImage *)_activityImage;
+- (NSString *)_systemImageName;
+- (NSString *)activityType;
+@end
+
 static BOOL isEnabled = NO;
 static NSDictionary *customIconsDict = nil;
 static NSMutableDictionary<NSString *, UIImage *> *imageCache = nil;
@@ -133,7 +158,8 @@ static NSString *extractIdentifier(id proxy) {
 
 - (void)setImage:(UIImage *)image {
     // iOS 16+ 有此方法
-    NSString *identifier = extractIdentifier(self.activityProxy);
+    id proxy = [self valueForKey:@"activityProxy"];
+    NSString *identifier = extractIdentifier(proxy);
     UIImage *custom = getCustomIconForID(identifier);
     if (custom) {
         %orig(custom);
