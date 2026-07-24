@@ -7,6 +7,7 @@
 @interface UIShareGroupActivityCell : UICollectionViewCell
 @property (nonatomic, strong) id activityProxy;
 @property (nonatomic, strong) UIImage *image;
+@property (nonatomic, strong) UIView *badgeSlotView;
 - (void)setActivityProxy:(id)proxy;
 - (void)setImage:(UIImage *)image;
 - (void)_updateImageView;
@@ -37,8 +38,10 @@ static NSMutableDictionary<NSString *, UIImage *> *imageCache = nil;
 static UIImage *testRedImage = nil;
 
 static void loadPrefs() {
+    // 强制同步多个域（解决 rootless / roothide / SharingUIService 读不到问题）
     CFPreferencesAppSynchronize(PREFS_DOMAIN);
     CFPreferencesAppSynchronize(kCFPreferencesAnyApplication);
+    CFPreferencesAppSynchronize(CFSTR("com.iosdump.customshareicon"));
 
     Boolean keyExists = false;
     Boolean enabledVal = CFPreferencesGetAppBooleanValue(CFSTR("Enabled"), PREFS_DOMAIN, &keyExists);
@@ -46,9 +49,16 @@ static void loadPrefs() {
         enabledVal = CFPreferencesGetAppBooleanValue(CFSTR("Enabled"), kCFPreferencesAnyApplication, &keyExists);
     }
 
+    // 多重尝试读取 Icons
     CFPropertyListRef iconsRef = CFPreferencesCopyAppValue(CFSTR("IOSDump_CSI_Icons"), PREFS_DOMAIN);
     if (!iconsRef) {
         iconsRef = CFPreferencesCopyAppValue(CFSTR("IOSDump_CSI_Icons"), kCFPreferencesAnyApplication);
+    }
+    if (!iconsRef) {
+        iconsRef = CFPreferencesCopyValue(CFSTR("IOSDump_CSI_Icons"), PREFS_DOMAIN, kCFPreferencesAnyUser, kCFPreferencesAnyHost);
+    }
+    if (!iconsRef) {
+        iconsRef = CFPreferencesCopyValue(CFSTR("IOSDump_CSI_Icons"), kCFPreferencesAnyApplication, kCFPreferencesAnyUser, kCFPreferencesAnyHost);
     }
 
     if (iconsRef && CFGetTypeID(iconsRef) == CFDictionaryGetTypeID()) {
@@ -58,6 +68,7 @@ static void loadPrefs() {
     }
     if (iconsRef) CFRelease(iconsRef);
 
+    // 有数据就强制开启
     isEnabled = (customIconsDict.count > 0) ? YES : (keyExists ? enabledVal : NO);
 
     if (!imageCache) imageCache = [NSMutableDictionary new];
@@ -114,7 +125,6 @@ static NSString *extractIdentifier(id proxy) {
     if (!proxy) return nil;
     NSString *result = nil;
 
-    // iOS 16/17 头文件：applicationBundleIdentifier
     @try {
         if ([proxy respondsToSelector:@selector(applicationBundleIdentifier)]) {
             result = [proxy valueForKey:@"applicationBundleIdentifier"];
@@ -172,7 +182,6 @@ static NSString *extractIdentifier(id proxy) {
         }
     } @catch (NSException *e) {}
 
-    // AirDrop 特殊处理
     @try {
         NSString *desc = [proxy description];
         if ([desc.lowercaseString containsString:@"airdrop"]) {
@@ -205,7 +214,7 @@ static BOOL isInShareSheetContext(UIView *view) {
     return NO;
 }
 
-#pragma mark - 主面板（强制 overlay + 全方法覆盖）
+#pragma mark - 主面板
 
 %hook UIShareGroupActivityCell
 
@@ -242,18 +251,15 @@ static BOOL isInShareSheetContext(UIView *view) {
 
 - (void)setHighlighted:(BOOL)highlighted {
     %orig;
-    // 长按后连续强制重盖（对抗 slot 回写）
     [self csi_applyCustomIcon];
-    dispatch_async(dispatch_get_main_queue(), ^{
+    dispatch_async(dispatch_get_main_queue(), ^{ [self csi_applyCustomIcon]; });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.08 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [self csi_applyCustomIcon];
     });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [self csi_applyCustomIcon];
     });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        [self csi_applyCustomIcon];
-    });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [self csi_applyCustomIcon];
     });
 }
@@ -274,17 +280,16 @@ static BOOL isInShareSheetContext(UIView *view) {
 
 %new
 - (void)csi_forceApplyAfterDelay {
-    // 专门给隔空投送和异步 slot 用
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [self csi_applyCustomIcon];
     });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [self csi_applyCustomIcon];
     });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.7 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [self csi_applyCustomIcon];
     });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [self csi_applyCustomIcon];
     });
 }
@@ -301,14 +306,14 @@ static BOOL isInShareSheetContext(UIView *view) {
         customImage = getCustomIconForID(identifier);
     }
     if (!customImage) {
-        customImage = getTestRedImage();  // 测试兜底
+        customImage = getTestRedImage();
     }
 
-    // ========== 强制使用 overlay（对抗 iOS 16/17 slot 回写）==========
     UIView *slotView = [self valueForKey:@"imageSlotView"];
     UIImageView *nativeIv = [self valueForKey:@"activityImageView"];
-    UIView *ref = nil;
+    UIView *badgeView = [self valueForKey:@"badgeSlotView"];
 
+    UIView *ref = nil;
     if (nativeIv && !CGRectIsEmpty(nativeIv.frame) && nativeIv.frame.size.width > 10) {
         ref = nativeIv;
     } else if (slotView && !CGRectIsEmpty(slotView.frame)) {
@@ -316,12 +321,10 @@ static BOOL isInShareSheetContext(UIView *view) {
     }
     if (!ref) return;
 
-    // 隐藏原生（防止 slot 回写后露出来）
     if (nativeIv) {
         nativeIv.hidden = YES;
         nativeIv.alpha = 0;
     }
-    // 不隐藏整个 slotView，避免布局错位
 
     UIImageView *customIv = [self.contentView viewWithTag:TAG_CUSTOM_ICON];
     if (!customIv) {
@@ -343,7 +346,10 @@ static BOOL isInShareSheetContext(UIView *view) {
 
     [self.contentView bringSubviewToFront:customIv];
 
-    // badge 置顶
+    // 强制把 badge 置顶
+    if (badgeView) {
+        [self.contentView bringSubviewToFront:badgeView];
+    }
     for (UIView *sub in self.contentView.subviews) {
         NSString *n = NSStringFromClass([sub class]).lowercaseString;
         if ([n containsString:@"badge"] || [n containsString:@"dot"]) {
@@ -450,7 +456,7 @@ static BOOL isInShareSheetContext(UIView *view) {
 %end
 
 %ctor {
-    NSLog(@"[CustomShareIcon] Tweak 加载完成 (强制overlay + 对抗slot回写版)");
+    NSLog(@"[CustomShareIcon] Tweak 加载完成 (强制overlay + 对抗slot回写 + 强化偏好读取版)");
     loadPrefs();
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
                                     NULL, (CFNotificationCallback)loadPrefs,
