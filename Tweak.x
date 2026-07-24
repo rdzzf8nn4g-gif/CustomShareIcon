@@ -6,18 +6,9 @@
 #define jbroot(path) path
 #endif
 
-// 声明可能用到的方法，避免编译器警告
-@protocol CSIActivityProtocol <NSObject>
-@optional
-- (NSString *)containingAppBundleIdentifier;
-- (NSString *)activityType;
-@end
-
-@interface UIShareGroupActivityCell : UICollectionViewCell
-- (id)activityProxy; // returns _UIHostActivityProxy
-- (UIImageView *)activityImageView;
-@end
-
+// =======================
+// 通用定义与沙盒穿透路径
+// =======================
 static NSString * GetMediaDir() {
     NSString *base = @"/var/mobile/Library/Preferences/com.iosdump.customshareicon.media";
 #if __has_include(<roothide.h>)
@@ -45,26 +36,27 @@ static NSString * GetPrefPath() {
 static BOOL isEnabled = NO;
 
 static void loadPrefs() {
+    // 强制使用字典读取，避免 CFPreferences 在某些高限制沙盒中失败
     NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:GetPrefPath()];
     isEnabled = dict[@"Enabled"] ? [dict[@"Enabled"] boolValue] : NO;
 }
 
-// 核心查找图片方法：支持精确匹配与前缀匹配
+// 核心查找图片：支持前缀匹配 (应对 com.tencent.xin.shareextension)
 static UIImage *getCustomIconForID(NSString *identifier) {
     if (!identifier || identifier.length == 0) return nil;
     NSString *dir = GetMediaDir();
     
-    // 1. 精确匹配 (比如原生分享事件: com.apple.UIKit.activity.CopyToPasteboard)
+    // 1. 精确匹配
     NSString *exactPath = [[dir stringByAppendingPathComponent:identifier] stringByAppendingPathExtension:@"png"];
     if ([[NSFileManager defaultManager] fileExistsAtPath:exactPath]) {
         return [UIImage imageWithContentsOfFile:exactPath];
     }
     
-    // 2. 智能前缀匹配 (核心修正：第三方应用实际传入的可能是 com.tencent.xin.shareextension)
+    // 2. 智能前缀匹配
     NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil];
     for (NSString *file in files) {
         if ([file hasSuffix:@".png"]) {
-            NSString *confID = [file stringByDeletingPathExtension]; // 用户填入的 com.tencent.xin
+            NSString *confID = [file stringByDeletingPathExtension]; 
             if (confID.length > 0 && [identifier hasPrefix:confID]) {
                 NSString *path = [dir stringByAppendingPathComponent:file];
                 return [UIImage imageWithContentsOfFile:path];
@@ -74,7 +66,78 @@ static UIImage *getCustomIconForID(NSString *identifier) {
     return nil;
 }
 
-// 通用提取标识符的方法
+// =======================
+// Cell UI 层拦截模块 (无视任何缓存，直接干预视图)
+// =======================
+static void handleCellUpdate(id cell) {
+    if (!isEnabled) return;
+    if (![cell respondsToSelector:@selector(activityProxy)]) return;
+    
+    id proxy = [cell performSelector:@selector(activityProxy)];
+    if (!proxy) return;
+    
+    NSString *actType = nil;
+    if ([proxy respondsToSelector:NSSelectorFromString(@"activityType")]) {
+        actType = [proxy valueForKey:@"activityType"];
+    }
+    
+    if (actType) {
+        UIImage *custom = getCustomIconForID(actType);
+        if (custom) {
+            if ([cell respondsToSelector:@selector(activityImageView)]) {
+                UIImageView *iv = [cell performSelector:@selector(activityImageView)];
+                if (iv && [iv isKindOfClass:[UIImageView class]]) {
+                    iv.image = custom; // 强行替换
+                }
+            }
+        }
+    }
+}
+
+// 宏定义：批量 Hook 各个 iOS 版本的 Cell 渲染类
+#define HOOK_SHARE_CELL(CellClass) \
+%hook CellClass \
+- (void)setImage:(UIImage *)img { \
+    if (isEnabled) { \
+        id proxy = [self respondsToSelector:@selector(activityProxy)] ? [self performSelector:@selector(activityProxy)] : nil; \
+        NSString *actType = proxy && [proxy respondsToSelector:NSSelectorFromString(@"activityType")] ? [proxy valueForKey:@"activityType"] : nil; \
+        if (actType) { \
+            UIImage *custom = getCustomIconForID(actType); \
+            if (custom) { \
+                %orig(custom); \
+                return; \
+            } \
+        } \
+    } \
+    %orig(img); \
+} \
+- (void)_updateImageView { \
+    %orig; \
+    handleCellUpdate(self); \
+} \
+- (void)layoutSubviews { \
+    %orig; \
+    handleCellUpdate(self); \
+} \
+%end
+
+// 针对 iOS 16-17 的 App 列表
+HOOK_SHARE_CELL(UIShareGroupActivityCell)
+// 针对 iOS 14-15 的 App 列表
+HOOK_SHARE_CELL(UIActivityGroupActivityCell)
+// 针对 iOS 14-17 的 动作(复制、Safari打开等) 列表
+HOOK_SHARE_CELL(UIActivityActionGroupCell)
+
+
+// =======================
+// 数据源层拦截模块 (备用，用于兜底某些原生功能)
+// =======================
+@protocol CSIActivityProtocol <NSObject>
+@optional
+- (NSString *)containingAppBundleIdentifier;
+- (NSString *)activityType;
+@end
+
 static NSString *getIdentifierForActivity(id<CSIActivityProtocol> activity) {
     NSString *identifier = nil;
     if ([activity respondsToSelector:@selector(containingAppBundleIdentifier)]) {
@@ -88,168 +151,51 @@ static NSString *getIdentifierForActivity(id<CSIActivityProtocol> activity) {
     return identifier;
 }
 
-// ==========================================
-// Hook 1: 暴力 Hook 负责显示的 UI 控件 (最稳妥)
-// ==========================================
-%hook UIShareGroupActivityCell
-
-// iOS 14-17 通用的视图更新生命周期
-- (void)layoutSubviews {
-    %orig;
-    if (!isEnabled) return;
-    
-    id proxy = [self activityProxy];
-    if (proxy && [proxy respondsToSelector:NSSelectorFromString(@"activityType")]) {
-        NSString *actType = [proxy valueForKey:@"activityType"];
-        UIImage *custom = getCustomIconForID(actType);
-        if (custom) {
-            if ([self respondsToSelector:@selector(activityImageView)]) {
-                UIImageView *iv = [self activityImageView];
-                if (iv) iv.image = custom;
-            }
-        }
-    }
-}
-
-// 针对 iOS 16-17 存在的专用设值方法
-- (void)setImage:(UIImage *)image {
-    if (isEnabled) {
-        id proxy = [self activityProxy];
-        if (proxy && [proxy respondsToSelector:NSSelectorFromString(@"activityType")]) {
-            NSString *actType = [proxy valueForKey:@"activityType"];
-            UIImage *custom = getCustomIconForID(actType);
-            if (custom) {
-                %orig(custom);
-                return;
-            }
-        }
-    }
-    %orig(image);
-}
-
-// 针对 UI 更新刷新方法
-- (void)_updateImageView {
-    %orig;
-    if (!isEnabled) return;
-    
-    id proxy = [self activityProxy];
-    if (proxy && [proxy respondsToSelector:NSSelectorFromString(@"activityType")]) {
-        NSString *actType = [proxy valueForKey:@"activityType"];
-        UIImage *custom = getCustomIconForID(actType);
-        if (custom) {
-            if ([self respondsToSelector:@selector(activityImageView)]) {
-                UIImageView *iv = [self activityImageView];
-                if (iv) iv.image = custom;
-            }
-        }
-    }
-}
-%end
-
-
-// ==========================================
-// Hook 2: 从数据源头进行拦截（覆盖原生动作和类方法）
-// ==========================================
 %hook UIActivity
-
-// 拦截底层根据 Bundle ID 获取图标的类方法
-+ (id)_activityImageForApplicationBundleIdentifier:(NSString *)identifier {
-    if (isEnabled && identifier) {
-        UIImage *custom = getCustomIconForID(identifier);
-        if (custom) return custom;
-    }
-    return %orig;
-}
-
-+ (id)_activitySettingsImageForApplicationBundleIdentifier:(NSString *)identifier {
-    if (isEnabled && identifier) {
-        UIImage *custom = getCustomIconForID(identifier);
-        if (custom) return custom;
-    }
-    return %orig;
-}
-
-// 拦截系统自带（如 Copy、Safari等）优先使用 SF Symbol 的机制
-- (NSString *)_systemImageName {
-    if (isEnabled) {
-        NSString *identifier = getIdentifierForActivity((id<CSIActivityProtocol>)self);
-        UIImage *custom = getCustomIconForID(identifier);
-        if (custom) {
-            // 如果我们有自定义图片，必须返回 nil，强迫系统回退去调用 _activityImage
-            return nil;
-        }
-    }
-    return %orig;
-}
-
-// 拦截实例方法
 - (UIImage *)activityImage {
     if (isEnabled) {
-        NSString *identifier = getIdentifierForActivity((id<CSIActivityProtocol>)self);
-        UIImage *custom = getCustomIconForID(identifier);
+        UIImage *custom = getCustomIconForID(getIdentifierForActivity((id<CSIActivityProtocol>)self));
         if (custom) return custom;
     }
     return %orig;
 }
-
 - (UIImage *)_activityImage {
     if (isEnabled) {
-        NSString *identifier = getIdentifierForActivity((id<CSIActivityProtocol>)self);
-        UIImage *custom = getCustomIconForID(identifier);
+        UIImage *custom = getCustomIconForID(getIdentifierForActivity((id<CSIActivityProtocol>)self));
         if (custom) return custom;
     }
     return %orig;
 }
-
 - (UIImage *)_actionImage {
     if (isEnabled) {
-        NSString *identifier = getIdentifierForActivity((id<CSIActivityProtocol>)self);
-        UIImage *custom = getCustomIconForID(identifier);
+        UIImage *custom = getCustomIconForID(getIdentifierForActivity((id<CSIActivityProtocol>)self));
         if (custom) return custom;
     }
     return %orig;
 }
-
+- (NSString *)_systemImageName {
+    if (isEnabled && getCustomIconForID(getIdentifierForActivity((id<CSIActivityProtocol>)self))) {
+        return nil; // 强行废掉系统图标 fallback
+    }
+    return %orig;
+}
 %end
 
-// 针对扩展类的强行覆盖
 %hook UIApplicationExtensionActivity
-
 - (UIImage *)activityImage {
     if (isEnabled) {
-        NSString *identifier = getIdentifierForActivity((id<CSIActivityProtocol>)self);
-        UIImage *custom = getCustomIconForID(identifier);
+        UIImage *custom = getCustomIconForID(getIdentifierForActivity((id<CSIActivityProtocol>)self));
         if (custom) return custom;
     }
     return %orig;
 }
-
 - (UIImage *)_activityImage {
     if (isEnabled) {
-        NSString *identifier = getIdentifierForActivity((id<CSIActivityProtocol>)self);
-        UIImage *custom = getCustomIconForID(identifier);
+        UIImage *custom = getCustomIconForID(getIdentifierForActivity((id<CSIActivityProtocol>)self));
         if (custom) return custom;
     }
     return %orig;
 }
-
-- (UIImage *)_actionImage {
-    if (isEnabled) {
-        NSString *identifier = getIdentifierForActivity((id<CSIActivityProtocol>)self);
-        UIImage *custom = getCustomIconForID(identifier);
-        if (custom) return custom;
-    }
-    return %orig;
-}
-
-- (NSString *)_systemImageName {
-    if (isEnabled) {
-        NSString *identifier = getIdentifierForActivity((id<CSIActivityProtocol>)self);
-        if (getCustomIconForID(identifier)) return nil;
-    }
-    return %orig;
-}
-
 %end
 
 %ctor {
