@@ -194,6 +194,11 @@ static NSString * GetCSIDir() {
         CFStringRef appID = CFSTR("com.iosdump.customshareicon");
         CFPreferencesSetAppValue((__bridge CFStringRef)specifier.properties[@"key"], (__bridge CFPropertyListRef)value, appID);
         CFPreferencesAppSynchronize(appID);
+        
+        // 核心修复：强行赋予 plist 文件 0777 权限，穿透系统服务的沙盒限制
+        NSString *prefPath = GetPrefPath();
+        [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions: @0777, NSFileProtectionKey: NSFileProtectionNone} ofItemAtPath:prefPath error:nil];
+        
         CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(), CFSTR("com.iosdump.customshareicon/ReloadPrefs"), NULL, NULL, YES);
     }
 }
