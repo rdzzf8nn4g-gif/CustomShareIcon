@@ -1,7 +1,7 @@
 #import "CustomShareIconRootListController.h"
 #import <Preferences/PSSpecifier.h>
 
-#define PREFS_DOMAIN CFSTR("com.iosdump.customshareicon")
+#define PREFS_ID @"com.iosdump.customshareicon"
 
 @implementation CustomShareIconRootListController
 
@@ -9,17 +9,23 @@
     [super viewDidLoad];
 }
 
-// =======================
-// 统一使用包域名（与 Tweak 完全一致）
-// =======================
+- (NSUserDefaults *)prefs {
+    static NSUserDefaults *prefs = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        prefs = [[NSUserDefaults alloc] initWithSuiteName:PREFS_ID];
+    });
+    return prefs;
+}
+
 - (NSDictionary *)getIconsDict {
-    id val = (__bridge_transfer id)CFPreferencesCopyAppValue(CFSTR("IOSDump_CSI_Icons"), PREFS_DOMAIN);
+    id val = [[self prefs] objectForKey:@"IOSDump_CSI_Icons"];
     return [val isKindOfClass:[NSDictionary class]] ? val : @{};
 }
 
 - (void)saveIconsDict:(NSDictionary *)icons {
-    CFPreferencesSetAppValue(CFSTR("IOSDump_CSI_Icons"), (__bridge CFDictionaryRef)icons, PREFS_DOMAIN);
-    CFPreferencesAppSynchronize(PREFS_DOMAIN);
+    [[self prefs] setObject:icons forKey:@"IOSDump_CSI_Icons"];
+    [[self prefs] synchronize];
     CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
                                          CFSTR("com.iosdump.customshareicon/ReloadPrefs"),
                                          NULL, NULL, YES);
@@ -30,7 +36,7 @@
         NSMutableArray *specs = [[self loadSpecifiersFromPlistName:@"Root" target:self] mutableCopy];
         NSDictionary *icons = [self getIconsDict];
 
-        if (icons && icons.count > 0) {
+        if (icons.count > 0) {
             PSSpecifier *group = [PSSpecifier preferenceSpecifierNamed:@"已配置的图标 (点击删除)"
                                                                target:self
                                                                   set:nil
@@ -78,24 +84,19 @@
 
     UIAlertAction *confirm = [UIAlertAction actionWithTitle:@"下一步(选图)" style:UIAlertActionStyleDefault handler:^(UIAlertAction * _Nonnull action) {
         NSString *input = alert.textFields.firstObject.text;
-        if (input && input.length > 0) {
+        if (input.length > 0) {
             self.pendingBundleID = input;
             [self presentMediaPicker];
         }
     }];
 
-    UIAlertAction *cancel = [UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil];
     [alert addAction:confirm];
-    [alert addAction:cancel];
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
 
-    UIViewController *topVC = self.view.window.rootViewController;
-    if (!topVC) topVC = self;
-    while (topVC.presentedViewController) {
-        topVC = topVC.presentedViewController;
-    }
+    UIViewController *topVC = self.view.window.rootViewController ?: self;
+    while (topVC.presentedViewController) topVC = topVC.presentedViewController;
     [topVC presentViewController:alert animated:YES completion:nil];
 }
-
 - (void)addNewIcon:(PSSpecifier *)spec { [self addNewIcon]; }
 
 - (void)deleteIcon:(PSSpecifier *)spec {
@@ -113,11 +114,8 @@
     }]];
     [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
 
-    UIViewController *topVC = self.view.window.rootViewController;
-    if (!topVC) topVC = self;
-    while (topVC.presentedViewController) {
-        topVC = topVC.presentedViewController;
-    }
+    UIViewController *topVC = self.view.window.rootViewController ?: self;
+    while (topVC.presentedViewController) topVC = topVC.presentedViewController;
     [topVC presentViewController:alert animated:YES completion:nil];
 }
 
@@ -130,11 +128,8 @@
             PHPickerViewController *picker = [[PHPickerViewController alloc] initWithConfiguration:config];
             picker.delegate = self;
 
-            UIViewController *topVC = self.view.window.rootViewController;
-            if (!topVC) topVC = self;
-            while (topVC.presentedViewController) {
-                topVC = topVC.presentedViewController;
-            }
+            UIViewController *topVC = self.view.window.rootViewController ?: self;
+            while (topVC.presentedViewController) topVC = topVC.presentedViewController;
             [topVC presentViewController:picker animated:YES completion:nil];
         }
     });
@@ -153,12 +148,11 @@
                 if ([object isKindOfClass:[UIImage class]]) {
                     UIImage *img = (UIImage *)object;
 
-                    // 压缩到合适大小
                     CGSize size = img.size;
                     CGFloat ratio = MIN(120.0 / size.width, 120.0 / size.height);
                     if (ratio < 1.0) {
                         CGSize newSize = CGSizeMake(size.width * ratio, size.height * ratio);
-                        UIGraphicsBeginImageContextWithOptions(newSize, NO, [UIScreen mainScreen].scale);
+                        UIGraphicsBeginImageContextWithOptions(newSize, NO, UIScreen.mainScreen.scale);
                         [img drawInRect:CGRectMake(0, 0, newSize.width, newSize.height)];
                         img = UIGraphicsGetImageFromCurrentImageContext();
                         UIGraphicsEndImageContext();
@@ -191,7 +185,7 @@
         NSString *base64 = icons[bundleID];
         if (base64) {
             NSData *data = [[NSData alloc] initWithBase64EncodedString:base64 options:0];
-            UIImage *savedImage = [UIImage imageWithData:data scale:[UIScreen mainScreen].scale];
+            UIImage *savedImage = [UIImage imageWithData:data scale:UIScreen.mainScreen.scale];
 
             UIImageView *previewView = [[UIImageView alloc] initWithFrame:CGRectMake(0, 0, 32, 32)];
             previewView.contentMode = UIViewContentModeScaleAspectFit;
@@ -206,12 +200,14 @@
     return cell;
 }
 
-// 开关也强制写到包域名
+// 关键：用 key 判断，而不是 identifier
 - (void)setPreferenceValue:(id)value specifier:(PSSpecifier *)specifier {
     [super setPreferenceValue:value specifier:specifier];
-    if ([specifier.identifier isEqualToString:@"Enabled"]) {
-        CFPreferencesSetAppValue(CFSTR("Enabled"), (__bridge CFPropertyListRef)value, PREFS_DOMAIN);
-        CFPreferencesAppSynchronize(PREFS_DOMAIN);
+
+    NSString *key = [specifier propertyForKey:@"key"];
+    if ([key isEqualToString:@"Enabled"]) {
+        [[self prefs] setObject:value forKey:@"Enabled"];
+        [[self prefs] synchronize];
         CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
                                              CFSTR("com.iosdump.customshareicon/ReloadPrefs"),
                                              NULL, NULL, YES);
