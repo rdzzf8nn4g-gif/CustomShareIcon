@@ -6,43 +6,29 @@
 #define jbroot(path) path
 #endif
 
-// =======================
-// 声明要 Hook 的类，避免编译器找不到类型
-// =======================
 @interface UIShareGroupActivityCell : UICollectionViewCell
 - (id)activityProxy;
 - (UIImageView *)activityImageView;
-- (UIView *)imageSlotView; // iOS 16+ 跨进程映射图层
+- (UIView *)imageSlotView;
 @end
 
 @interface UIActivityGroupActivityCell : UICollectionViewCell
 - (id)activityProxy;
 - (UIImageView *)activityImageView;
+- (UIView *)imageSlotView;
 @end
 
 @interface UIActivityActionGroupCell : UICollectionViewCell
 - (id)activityProxy;
 - (UIImageView *)activityImageView;
+- (UIView *)imageSlotView;
 @end
 
-
 // =======================
-// 通用定义与沙盒穿透路径
+// 通用定义与沙盒穿透路径 (与设置一致)
 // =======================
 static NSString * GetMediaDir() {
-    NSString *base = @"/var/mobile/Library/Preferences/com.iosdump.customshareicon.media";
-#if __has_include(<roothide.h>)
-    return jbroot(base);
-#else
-    if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/jb/"]) {
-        return [@"/var/jb" stringByAppendingPathComponent:base];
-    }
-    return base;
-#endif
-}
-
-static NSString * GetPrefPath() {
-    NSString *base = @"/var/mobile/Library/Preferences/com.iosdump.customshareicon.plist";
+    NSString *base = @"/Library/Application Support/CustomShareIcon";
 #if __has_include(<roothide.h>)
     return jbroot(base);
 #else
@@ -55,25 +41,26 @@ static NSString * GetPrefPath() {
 
 static BOOL isEnabled = NO;
 
+// 直接读取物理文件判断开关，彻底避开 cfprefsd 沙盒权限！
 static void loadPrefs() {
-    NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:GetPrefPath()];
-    isEnabled = dict[@"Enabled"] ? [dict[@"Enabled"] boolValue] : NO;
+    NSString *flagPath = [GetMediaDir() stringByAppendingPathComponent:@"enabled.txt"];
+    if ([[NSFileManager defaultManager] fileExistsAtPath:flagPath]) {
+        NSString *val = [NSString stringWithContentsOfFile:flagPath encoding:NSUTF8StringEncoding error:nil];
+        isEnabled = [val isEqualToString:@"1"];
+    } else {
+        isEnabled = NO;
+    }
 }
 
-// =======================
-// 核心读取与匹配逻辑
-// =======================
 static UIImage *getCustomIconForID(NSString *identifier) {
     if (!identifier || identifier.length == 0) return nil;
     NSString *dir = GetMediaDir();
     
-    // 1. 精确匹配
     NSString *exactPath = [[dir stringByAppendingPathComponent:identifier] stringByAppendingPathExtension:@"png"];
     if ([[NSFileManager defaultManager] fileExistsAtPath:exactPath]) {
         return [UIImage imageWithContentsOfFile:exactPath];
     }
     
-    // 2. 智能前缀匹配 (针对 com.tencent.xin.shareextension)
     NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil];
     for (NSString *file in files) {
         if ([file hasSuffix:@".png"]) {
@@ -95,13 +82,10 @@ static UIImage *getCustomIconForCell(id cell) {
     if (!proxy) return nil;
     
     NSString *identifier = nil;
-    
-    // 优先 1：读取 iOS 16-17 _UIHostActivityProxy 特有的 applicationBundleIdentifier
     if ([proxy respondsToSelector:NSSelectorFromString(@"applicationBundleIdentifier")]) {
         identifier = [proxy valueForKey:@"applicationBundleIdentifier"];
     }
     
-    // 优先 2：深入读取原始 activity 的 identifier (兼容 iOS 14-15)
     if ((!identifier || identifier.length == 0) && [proxy respondsToSelector:NSSelectorFromString(@"activity")]) {
         id activity = [proxy valueForKey:@"activity"];
         if (activity) {
@@ -122,20 +106,20 @@ static UIImage *getCustomIconForCell(id cell) {
     return nil;
 }
 
-// 核心杀手锏：接管视图并抹除跨进程 Slot 映射
+// 核心强杀跨进程图层：处理复用，抹除 slot
 static void handleCellUpdate(id cell) {
+    if (!isEnabled) return;
     UIImage *custom = getCustomIconForCell(cell);
+    
     if (custom) {
-        // 1. 隐藏 iOS 16+ 的跨进程渲染图层 (SlotView)，这是图标死活不生效的罪魁祸首！
         if ([cell respondsToSelector:@selector(imageSlotView)]) {
             UIView *slotView = [cell performSelector:@selector(imageSlotView)];
-            if (slotView && [slotView isKindOfClass:[UIView class]]) {
+            if (slotView) {
                 slotView.hidden = YES;
                 slotView.alpha = 0;
             }
         }
         
-        // 2. 强行把我们的图片设置给底层的 activityImageView 并确保显示
         if ([cell respondsToSelector:@selector(activityImageView)]) {
             UIImageView *iv = [cell performSelector:@selector(activityImageView)];
             if (iv && [iv isKindOfClass:[UIImageView class]]) {
@@ -144,23 +128,22 @@ static void handleCellUpdate(id cell) {
                 iv.alpha = 1.0;
             }
         }
+    } else {
+        // 如果没有自定义图标，必须恢复原状，否则 Cell 复用时图标会丢失！
+        if ([cell respondsToSelector:@selector(imageSlotView)]) {
+            UIView *slotView = [cell performSelector:@selector(imageSlotView)];
+            if (slotView) {
+                slotView.hidden = NO;
+                slotView.alpha = 1.0;
+            }
+        }
     }
 }
 
-
 // =======================
-// Cell UI 渲染劫持模块
+// UI 渲染劫持
 // =======================
-
 %hook UIShareGroupActivityCell
-- (void)setImage:(UIImage *)img {
-    UIImage *custom = getCustomIconForCell(self);
-    if (custom) {
-        %orig(custom);
-        return;
-    }
-    %orig(img);
-}
 - (void)_updateImageView {
     %orig;
     handleCellUpdate(self);
@@ -172,14 +155,6 @@ static void handleCellUpdate(id cell) {
 %end
 
 %hook UIActivityGroupActivityCell
-- (void)setImage:(UIImage *)img {
-    UIImage *custom = getCustomIconForCell(self);
-    if (custom) {
-        %orig(custom);
-        return;
-    }
-    %orig(img);
-}
 - (void)_updateImageView {
     %orig;
     handleCellUpdate(self);
@@ -191,14 +166,6 @@ static void handleCellUpdate(id cell) {
 %end
 
 %hook UIActivityActionGroupCell
-- (void)setImage:(UIImage *)img {
-    UIImage *custom = getCustomIconForCell(self);
-    if (custom) {
-        %orig(custom);
-        return;
-    }
-    %orig(img);
-}
 - (void)_updateImageView {
     %orig;
     handleCellUpdate(self);
