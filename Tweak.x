@@ -38,20 +38,38 @@ static NSMutableDictionary<NSString *, UIImage *> *imageCache = nil;
 static UIImage *testRedImage = nil;
 
 static void loadPrefs() {
+    // ========== 强制多路径读取（解决 iOS 17 无根/隐根读不到问题）==========
     CFPreferencesAppSynchronize(PREFS_DOMAIN);
     CFPreferencesAppSynchronize(kCFPreferencesAnyApplication);
     CFPreferencesAppSynchronize(CFSTR("com.iosdump.customshareicon"));
+
+    // 额外强制
+    CFPreferencesSynchronize(PREFS_DOMAIN, kCFPreferencesAnyUser, kCFPreferencesAnyHost);
+    CFPreferencesSynchronize(kCFPreferencesAnyApplication, kCFPreferencesAnyUser, kCFPreferencesAnyHost);
 
     Boolean keyExists = false;
     Boolean enabledVal = CFPreferencesGetAppBooleanValue(CFSTR("Enabled"), PREFS_DOMAIN, &keyExists);
     if (!keyExists) {
         enabledVal = CFPreferencesGetAppBooleanValue(CFSTR("Enabled"), kCFPreferencesAnyApplication, &keyExists);
     }
+    if (!keyExists) {
+        enabledVal = CFPreferencesGetAppBooleanValue(CFSTR("Enabled"), CFSTR("com.iosdump.customshareicon"), &keyExists);
+    }
 
-    CFPropertyListRef iconsRef = CFPreferencesCopyAppValue(CFSTR("IOSDump_CSI_Icons"), PREFS_DOMAIN);
+    CFPropertyListRef iconsRef = NULL;
+
+    // 路径1
+    iconsRef = CFPreferencesCopyAppValue(CFSTR("IOSDump_CSI_Icons"), PREFS_DOMAIN);
+    // 路径2
     if (!iconsRef) iconsRef = CFPreferencesCopyAppValue(CFSTR("IOSDump_CSI_Icons"), kCFPreferencesAnyApplication);
+    // 路径3
+    if (!iconsRef) iconsRef = CFPreferencesCopyAppValue(CFSTR("IOSDump_CSI_Icons"), CFSTR("com.iosdump.customshareicon"));
+    // 路径4
     if (!iconsRef) iconsRef = CFPreferencesCopyValue(CFSTR("IOSDump_CSI_Icons"), PREFS_DOMAIN, kCFPreferencesAnyUser, kCFPreferencesAnyHost);
+    // 路径5
     if (!iconsRef) iconsRef = CFPreferencesCopyValue(CFSTR("IOSDump_CSI_Icons"), kCFPreferencesAnyApplication, kCFPreferencesAnyUser, kCFPreferencesAnyHost);
+    // 路径6（兼容部分隐根）
+    if (!iconsRef) iconsRef = CFPreferencesCopyValue(CFSTR("IOSDump_CSI_Icons"), CFSTR("com.iosdump.customshareicon"), kCFPreferencesAnyUser, kCFPreferencesAnyHost);
 
     if (iconsRef && CFGetTypeID(iconsRef) == CFDictionaryGetTypeID()) {
         customIconsDict = [(__bridge NSDictionary *)iconsRef copy];
@@ -60,6 +78,7 @@ static void loadPrefs() {
     }
     if (iconsRef) CFRelease(iconsRef);
 
+    // 有数据就强制开启
     isEnabled = (customIconsDict.count > 0) ? YES : (keyExists ? enabledVal : NO);
 
     if (!imageCache) imageCache = [NSMutableDictionary new];
@@ -82,7 +101,7 @@ static UIImage *getTestRedImage() {
     return testRedImage;
 }
 
-// 大幅放宽匹配
+// 宽松匹配
 static UIImage *getCustomIconForID(NSString *identifier) {
     if (!isEnabled || !identifier.length || !customIconsDict.count) return nil;
     if (imageCache[identifier]) return imageCache[identifier];
@@ -90,11 +109,11 @@ static UIImage *getCustomIconForID(NSString *identifier) {
     NSString *base64Str = nil;
     NSString *matchedKey = nil;
 
-    // 1. 精确匹配
+    // 1. 精确
     base64Str = customIconsDict[identifier];
     if (base64Str) matchedKey = identifier;
 
-    // 2. 忽略大小写精确匹配
+    // 2. 忽略大小写
     if (!base64Str) {
         for (NSString *key in customIconsDict) {
             if ([identifier caseInsensitiveCompare:key] == NSOrderedSame) {
@@ -105,7 +124,7 @@ static UIImage *getCustomIconForID(NSString *identifier) {
         }
     }
 
-    // 3. 包含匹配（双向）
+    // 3. 双向包含
     if (!base64Str) {
         for (NSString *key in customIconsDict) {
             if (key.length == 0) continue;
@@ -118,7 +137,7 @@ static UIImage *getCustomIconForID(NSString *identifier) {
         }
     }
 
-    // 4. 最后一段匹配（例如 mqq、discover、xin）
+    // 4. 最后一段匹配
     if (!base64Str) {
         NSString *last = [[identifier componentsSeparatedByString:@"."] lastObject];
         if (last.length > 2) {
@@ -146,10 +165,12 @@ static UIImage *getCustomIconForID(NSString *identifier) {
     return img;
 }
 
+// 兼容 iOS 14 头文件 + iOS 16/17 头文件
 static NSString *extractIdentifier(id proxy) {
     if (!proxy) return nil;
     NSString *result = nil;
 
+    // iOS 16+ 
     @try {
         if ([proxy respondsToSelector:@selector(applicationBundleIdentifier)]) {
             result = [proxy valueForKey:@"applicationBundleIdentifier"];
@@ -157,6 +178,7 @@ static NSString *extractIdentifier(id proxy) {
         }
     } @catch (NSException *e) {}
 
+    // iOS 14-15 主要路径
     id activity = nil;
     @try { activity = [proxy valueForKey:@"activity"]; } @catch (NSException *e) {}
 
@@ -198,7 +220,7 @@ static NSString *extractIdentifier(id proxy) {
         }
     } @catch (NSException *e) {}
 
-    // 从 description 里直接找已配置的 key
+    // 从 description 直接匹配已配置 key（对 iOS 14 和提取失败场景很有用）
     @try {
         NSString *desc = [[proxy description] lowercaseString];
         for (NSString *key in customIconsDict) {
@@ -232,6 +254,8 @@ static BOOL isInShareSheetContext(UIView *view) {
     }
     return NO;
 }
+
+#pragma mark - 主面板
 
 %hook UIShareGroupActivityCell
 
@@ -376,6 +400,8 @@ static BOOL isInShareSheetContext(UIView *view) {
 
 %end
 
+#pragma mark - 「更多」列表
+
 %hook UITableViewCell
 
 - (void)layoutSubviews {
@@ -424,6 +450,8 @@ static BOOL isInShareSheetContext(UIView *view) {
 
 %end
 
+#pragma mark - UIActivity 拦截
+
 %hook UIActivity
 
 + (id)_activityImageForApplicationBundleIdentifier:(NSString *)identifier {
@@ -468,7 +496,7 @@ static BOOL isInShareSheetContext(UIView *view) {
 %end
 
 %ctor {
-    NSLog(@"[CustomShareIcon] Tweak 加载完成 (宽松匹配 + 强制overlay版)");
+    NSLog(@"[CustomShareIcon] Tweak 加载完成 (iOS17路径强化 + 全版本兼容版)");
     loadPrefs();
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
                                     NULL, (CFNotificationCallback)loadPrefs,
