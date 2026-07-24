@@ -8,6 +8,8 @@
 @property (nonatomic, strong) id activityProxy;
 - (void)setActivityProxy:(id)proxy;
 - (void)csi_applyCustomIcon;
+- (void)_updateImageView;                          // iOS 16+
+- (void)_configureImageViewForPlaceholder;         // iOS 17
 @end
 
 @interface UIApplicationExtensionActivity : UIActivity
@@ -31,24 +33,20 @@ static NSMutableDictionary<NSString *, UIImage *> *imageCache = nil;
 static UIImage *testRedImage = nil;
 
 static void loadPrefs() {
-    // 多重强制同步，解决多进程读不到的问题
     CFPreferencesAppSynchronize(PREFS_DOMAIN);
     CFPreferencesAppSynchronize(kCFPreferencesAnyApplication);
 
     Boolean keyExists = false;
     Boolean enabledVal = CFPreferencesGetAppBooleanValue(CFSTR("Enabled"), PREFS_DOMAIN, &keyExists);
-    
-    // 如果包域名读不到，再试全局域
     if (!keyExists) {
         enabledVal = CFPreferencesGetAppBooleanValue(CFSTR("Enabled"), kCFPreferencesAnyApplication, &keyExists);
     }
-    
-    // 最终兜底：只要有配置图标就强制开启（测试阶段）
+
     CFPropertyListRef iconsRef = CFPreferencesCopyAppValue(CFSTR("IOSDump_CSI_Icons"), PREFS_DOMAIN);
     if (!iconsRef) {
         iconsRef = CFPreferencesCopyAppValue(CFSTR("IOSDump_CSI_Icons"), kCFPreferencesAnyApplication);
     }
-    
+
     if (iconsRef && CFGetTypeID(iconsRef) == CFDictionaryGetTypeID()) {
         customIconsDict = [(__bridge NSDictionary *)iconsRef copy];
     } else {
@@ -56,13 +54,13 @@ static void loadPrefs() {
     }
     if (iconsRef) CFRelease(iconsRef);
 
-    // 关键：有图标就强制当开启处理，解决大部分进程 enabled=0 的问题
+    // 有配置就强制开启，保证所有进程一致
     isEnabled = (customIconsDict.count > 0) ? YES : (keyExists ? enabledVal : NO);
 
     if (!imageCache) imageCache = [NSMutableDictionary new];
     else [imageCache removeAllObjects];
 
-    NSLog(@"[CustomShareIcon] loadPrefs enabled=%d count=%lu (强制兜底)", isEnabled, (unsigned long)(customIconsDict ? customIconsDict.count : 0));
+    NSLog(@"[CustomShareIcon] loadPrefs enabled=%d count=%lu", isEnabled, (unsigned long)(customIconsDict ? customIconsDict.count : 0));
 }
 
 static UIImage *getTestRedImage() {
@@ -105,6 +103,7 @@ static NSString *extractIdentifier(id proxy) {
     if (!proxy) return nil;
     NSString *result = nil;
 
+    // iOS 16+ 优先
     if ([proxy respondsToSelector:@selector(applicationBundleIdentifier)]) {
         result = [proxy valueForKey:@"applicationBundleIdentifier"];
         if (result.length) return result;
@@ -147,10 +146,8 @@ static BOOL isInShareSheetContext(UIView *view) {
     UIResponder *r = view;
     while (r) {
         NSString *cls = NSStringFromClass([r class]);
-        if ([cls containsString:@"Activity"] ||
-            [cls containsString:@"ShareSheet"] ||
-            [cls containsString:@"SHSheet"] ||
-            [cls containsString:@"UIActivity"] ||
+        if ([cls containsString:@"Activity"] || [cls containsString:@"ShareSheet"] ||
+            [cls containsString:@"SHSheet"] || [cls containsString:@"UIActivity"] ||
             [cls containsString:@"Share"]) {
             return YES;
         }
@@ -159,17 +156,17 @@ static BOOL isInShareSheetContext(UIView *view) {
     return NO;
 }
 
-#pragma mark - 主水平滑动面板
+#pragma mark - 主面板 UIShareGroupActivityCell（iOS 14-17）
 
 %hook UIShareGroupActivityCell
 
 - (void)setActivityProxy:(id)proxy {
     %orig;
     [self csi_applyCustomIcon];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [self csi_applyCustomIcon];
     });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [self csi_applyCustomIcon];
     });
 }
@@ -179,7 +176,18 @@ static BOOL isInShareSheetContext(UIView *view) {
     [self csi_applyCustomIcon];
 }
 
-// 长按/高亮时重新盖一层，防止变黑
+// iOS 16+
+- (void)_updateImageView {
+    %orig;
+    [self csi_applyCustomIcon];
+}
+
+// iOS 17
+- (void)_configureImageViewForPlaceholder {
+    %orig;
+    [self csi_applyCustomIcon];
+}
+
 - (void)setHighlighted:(BOOL)highlighted {
     %orig;
     [self csi_applyCustomIcon];
@@ -212,48 +220,76 @@ static BOOL isInShareSheetContext(UIView *view) {
     UIView *slotView = [self valueForKey:@"imageSlotView"];
     UIImageView *nativeIv = [self valueForKey:@"activityImageView"];
 
-    // 只隐藏主图标，尽量不碰 badge
-    if (slotView) {
-        slotView.hidden = YES;
-        slotView.alpha = 0;
-    }
-    if (nativeIv) {
-        nativeIv.hidden = YES;
-        nativeIv.alpha = 0;
-    }
-
-    UIImageView *customIv = [self.contentView viewWithTag:TAG_CUSTOM_ICON];
-    if (!customIv) {
-        customIv = [UIImageView new];
-        customIv.tag = TAG_CUSTOM_ICON;
-        customIv.contentMode = UIViewContentModeScaleAspectFit;
-        customIv.clipsToBounds = YES;
-        customIv.userInteractionEnabled = NO;
-        [self.contentView addSubview:customIv];
+    // ========== 优先方案：直接改原生图片（减少错位和 badge 遮挡）==========
+    BOOL applied = NO;
+    if (nativeIv && [nativeIv isKindOfClass:[UIImageView class]]) {
+        nativeIv.image = customImage;
+        nativeIv.hidden = NO;
+        nativeIv.alpha = 1.0;
+        nativeIv.contentMode = UIViewContentModeScaleAspectFit;
+        applied = YES;
     }
 
-    [self.contentView bringSubviewToFront:customIv];
+    // 如果原生改不了，再用 overlay（但尽量不碰 badge）
+    if (!applied) {
+        if (slotView) {
+            // 不隐藏整个 slotView，只尝试找里面的 imageView
+            for (UIView *sub in slotView.subviews) {
+                if ([sub isKindOfClass:[UIImageView class]]) {
+                    ((UIImageView *)sub).image = customImage;
+                    applied = YES;
+                    break;
+                }
+            }
+        }
+    }
 
-    UIView *ref = (nativeIv && !CGRectIsEmpty(nativeIv.frame)) ? nativeIv : slotView;
-    if (ref && !CGRectIsEmpty(ref.frame)) {
-        // 稍微缩小一点，减少对右上角 badge 的遮挡
-        CGRect f = ref.frame;
-        CGFloat inset = 1.5;
-        customIv.frame = CGRectInset(f, inset, inset);
-        customIv.layer.cornerRadius = (ref.layer.cornerRadius > 0 ? ref.layer.cornerRadius : 13.0) - inset;
+    // 最终兜底 overlay（缩小范围，减少盖 badge）
+    if (!applied) {
+        UIImageView *customIv = [self.contentView viewWithTag:TAG_CUSTOM_ICON];
+        if (!customIv) {
+            customIv = [UIImageView new];
+            customIv.tag = TAG_CUSTOM_ICON;
+            customIv.contentMode = UIViewContentModeScaleAspectFit;
+            customIv.clipsToBounds = YES;
+            customIv.userInteractionEnabled = NO;
+            [self.contentView addSubview:customIv];
+        }
+        [self.contentView bringSubviewToFront:customIv];
+
+        UIView *ref = nativeIv ?: slotView;
+        if (ref && !CGRectIsEmpty(ref.frame)) {
+            // 明显内缩，给 badge 留位置
+            CGFloat inset = 3.0;
+            customIv.frame = CGRectInset(ref.frame, inset, inset);
+            customIv.layer.cornerRadius = MAX(0, (ref.layer.cornerRadius > 0 ? ref.layer.cornerRadius : 13.0) - inset);
+        } else {
+            customIv.frame = CGRectMake((self.contentView.bounds.size.width - 52)/2.0, 4, 52, 52);
+            customIv.layer.cornerRadius = 11.0;
+        }
+        customIv.image = customImage;
+        customIv.hidden = NO;
+        customIv.alpha = 1.0;
     } else {
-        customIv.frame = CGRectMake((self.contentView.bounds.size.width - 56)/2.0, 2, 56, 56);
-        customIv.layer.cornerRadius = 12.0;
+        // 已经用原生方式成功，把旧的 overlay 隐藏
+        UIImageView *old = [self.contentView viewWithTag:TAG_CUSTOM_ICON];
+        if (old) old.hidden = YES;
     }
 
-    customIv.image = customImage;
-    customIv.hidden = NO;
-    customIv.alpha = 1.0;
+    // 尝试把 badge 相关 view 重新置顶（避免被盖）
+    for (UIView *sub in self.contentView.subviews) {
+        NSString *cls = NSStringFromClass([sub class]);
+        if ([cls.lowercaseString containsString:@"badge"] ||
+            [cls.lowercaseString containsString:@"dot"] ||
+            sub.tag == 999) {   // 有些 badge 用特殊 tag
+            [self.contentView bringSubviewToFront:sub];
+        }
+    }
 }
 
 %end
 
-#pragma mark - 「更多」列表 + TableView 场景
+#pragma mark - 「更多」列表
 
 %hook UITableViewCell
 
@@ -265,17 +301,19 @@ static BOOL isInShareSheetContext(UIView *view) {
     if (!imageRef || CGRectIsEmpty(imageRef.frame) || imageRef.frame.size.width < 24) {
         for (UIView *sub in self.contentView.subviews) {
             if ([sub isKindOfClass:[UIImageView class]] &&
-                sub.frame.size.width >= 28 && sub.frame.size.width <= 64) {
+                sub.frame.size.width >= 28 && sub.frame.size.width <= 70) {
                 imageRef = sub;
                 break;
             }
         }
     }
 
-    if (imageRef) {
-        imageRef.hidden = YES;
-        imageRef.alpha = 0;
+    if (imageRef && [imageRef isKindOfClass:[UIImageView class]]) {
+        // 优先直接改图，不隐藏，减少错位
+        ((UIImageView *)imageRef).image = getTestRedImage();
+        ((UIImageView *)imageRef).contentMode = UIViewContentModeScaleAspectFit;
 
+        // 如果改完后还是被系统覆盖，再用小 overlay
         UIImageView *customIv = [self.contentView viewWithTag:TAG_CUSTOM_ICON];
         if (!customIv) {
             customIv = [UIImageView new];
@@ -284,20 +322,17 @@ static BOOL isInShareSheetContext(UIView *view) {
             customIv.clipsToBounds = YES;
             [self.contentView addSubview:customIv];
         }
-        [self.contentView bringSubviewToFront:customIv];
-
-        customIv.frame = CGRectInset(imageRef.frame, 1.0, 1.0);
-        customIv.layer.cornerRadius = 8.0;
+        customIv.frame = CGRectInset(imageRef.frame, 1.5, 1.5);
+        customIv.layer.cornerRadius = 7.0;
         customIv.image = getTestRedImage();
         customIv.hidden = NO;
-        customIv.alpha = 1.0;
+        [self.contentView bringSubviewToFront:customIv];
     }
 }
 
 - (void)setHighlighted:(BOOL)highlighted {
     %orig;
     if (isEnabled && isInShareSheetContext(self)) {
-        // 长按后重新盖
         dispatch_async(dispatch_get_main_queue(), ^{
             [self setNeedsLayout];
         });
@@ -315,7 +350,7 @@ static BOOL isInShareSheetContext(UIView *view) {
 
 %end
 
-#pragma mark - UIActivity 图片拦截
+#pragma mark - UIActivity 图片拦截（全版本通用）
 
 %hook UIActivity
 
@@ -361,7 +396,7 @@ static BOOL isInShareSheetContext(UIView *view) {
 %end
 
 %ctor {
-    NSLog(@"[CustomShareIcon] Tweak 加载完成 (强制兜底 + 长按防掉色版)");
+    NSLog(@"[CustomShareIcon] Tweak 加载完成 (iOS14-17 优化 + 优先原生改图版)");
     loadPrefs();
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
                                     NULL, (CFNotificationCallback)loadPrefs,
