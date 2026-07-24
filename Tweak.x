@@ -38,7 +38,6 @@ static NSMutableDictionary<NSString *, UIImage *> *imageCache = nil;
 static UIImage *testRedImage = nil;
 
 static void loadPrefs() {
-    // 强制同步多个域（解决 rootless / roothide / SharingUIService 读不到问题）
     CFPreferencesAppSynchronize(PREFS_DOMAIN);
     CFPreferencesAppSynchronize(kCFPreferencesAnyApplication);
     CFPreferencesAppSynchronize(CFSTR("com.iosdump.customshareicon"));
@@ -49,17 +48,10 @@ static void loadPrefs() {
         enabledVal = CFPreferencesGetAppBooleanValue(CFSTR("Enabled"), kCFPreferencesAnyApplication, &keyExists);
     }
 
-    // 多重尝试读取 Icons
     CFPropertyListRef iconsRef = CFPreferencesCopyAppValue(CFSTR("IOSDump_CSI_Icons"), PREFS_DOMAIN);
-    if (!iconsRef) {
-        iconsRef = CFPreferencesCopyAppValue(CFSTR("IOSDump_CSI_Icons"), kCFPreferencesAnyApplication);
-    }
-    if (!iconsRef) {
-        iconsRef = CFPreferencesCopyValue(CFSTR("IOSDump_CSI_Icons"), PREFS_DOMAIN, kCFPreferencesAnyUser, kCFPreferencesAnyHost);
-    }
-    if (!iconsRef) {
-        iconsRef = CFPreferencesCopyValue(CFSTR("IOSDump_CSI_Icons"), kCFPreferencesAnyApplication, kCFPreferencesAnyUser, kCFPreferencesAnyHost);
-    }
+    if (!iconsRef) iconsRef = CFPreferencesCopyAppValue(CFSTR("IOSDump_CSI_Icons"), kCFPreferencesAnyApplication);
+    if (!iconsRef) iconsRef = CFPreferencesCopyValue(CFSTR("IOSDump_CSI_Icons"), PREFS_DOMAIN, kCFPreferencesAnyUser, kCFPreferencesAnyHost);
+    if (!iconsRef) iconsRef = CFPreferencesCopyValue(CFSTR("IOSDump_CSI_Icons"), kCFPreferencesAnyApplication, kCFPreferencesAnyUser, kCFPreferencesAnyHost);
 
     if (iconsRef && CFGetTypeID(iconsRef) == CFDictionaryGetTypeID()) {
         customIconsDict = [(__bridge NSDictionary *)iconsRef copy];
@@ -68,7 +60,6 @@ static void loadPrefs() {
     }
     if (iconsRef) CFRelease(iconsRef);
 
-    // 有数据就强制开启
     isEnabled = (customIconsDict.count > 0) ? YES : (keyExists ? enabledVal : NO);
 
     if (!imageCache) imageCache = [NSMutableDictionary new];
@@ -91,24 +82,58 @@ static UIImage *getTestRedImage() {
     return testRedImage;
 }
 
+// 大幅放宽匹配
 static UIImage *getCustomIconForID(NSString *identifier) {
-    if (!isEnabled || !identifier.length || !customIconsDict) return nil;
+    if (!isEnabled || !identifier.length || !customIconsDict.count) return nil;
     if (imageCache[identifier]) return imageCache[identifier];
 
-    NSString *base64Str = customIconsDict[identifier];
+    NSString *base64Str = nil;
+    NSString *matchedKey = nil;
+
+    // 1. 精确匹配
+    base64Str = customIconsDict[identifier];
+    if (base64Str) matchedKey = identifier;
+
+    // 2. 忽略大小写精确匹配
     if (!base64Str) {
         for (NSString *key in customIconsDict) {
-            if (key.length && ([identifier caseInsensitiveCompare:key] == NSOrderedSame ||
-                               [identifier containsString:key] || [key containsString:identifier])) {
+            if ([identifier caseInsensitiveCompare:key] == NSOrderedSame) {
                 base64Str = customIconsDict[key];
+                matchedKey = key;
                 break;
             }
         }
     }
+
+    // 3. 包含匹配（双向）
     if (!base64Str) {
-        NSLog(@"[CustomShareIcon] ❌ 未找到匹配图标 key=%@ 现有keys=%@", identifier, customIconsDict.allKeys);
-        return nil;
+        for (NSString *key in customIconsDict) {
+            if (key.length == 0) continue;
+            if ([identifier.lowercaseString containsString:key.lowercaseString] ||
+                [key.lowercaseString containsString:identifier.lowercaseString]) {
+                base64Str = customIconsDict[key];
+                matchedKey = key;
+                break;
+            }
+        }
     }
+
+    // 4. 最后一段匹配（例如 mqq、discover、xin）
+    if (!base64Str) {
+        NSString *last = [[identifier componentsSeparatedByString:@"."] lastObject];
+        if (last.length > 2) {
+            for (NSString *key in customIconsDict) {
+                NSString *keyLast = [[key componentsSeparatedByString:@"."] lastObject];
+                if ([last caseInsensitiveCompare:keyLast] == NSOrderedSame) {
+                    base64Str = customIconsDict[key];
+                    matchedKey = key;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!base64Str) return nil;
 
     NSData *data = [[NSData alloc] initWithBase64EncodedString:base64Str options:0];
     if (!data) return nil;
@@ -116,7 +141,7 @@ static UIImage *getCustomIconForID(NSString *identifier) {
     UIImage *img = [UIImage imageWithData:data scale:3.0];
     if (img) {
         imageCache[identifier] = img;
-        NSLog(@"[CustomShareIcon] ✅ 真实图标加载成功 → %@", identifier);
+        NSLog(@"[CustomShareIcon] ✅ 匹配成功 %@ → %@", identifier, matchedKey);
     }
     return img;
 }
@@ -128,10 +153,7 @@ static NSString *extractIdentifier(id proxy) {
     @try {
         if ([proxy respondsToSelector:@selector(applicationBundleIdentifier)]) {
             result = [proxy valueForKey:@"applicationBundleIdentifier"];
-            if (result.length) {
-                NSLog(@"[CustomShareIcon] 提取 applicationBundleIdentifier = %@", result);
-                return result;
-            }
+            if (result.length) return result;
         }
     } @catch (NSException *e) {}
 
@@ -142,10 +164,7 @@ static NSString *extractIdentifier(id proxy) {
         @try {
             if ([activity respondsToSelector:@selector(containingAppBundleIdentifier)]) {
                 result = [activity valueForKey:@"containingAppBundleIdentifier"];
-                if (result.length) {
-                    NSLog(@"[CustomShareIcon] 提取 containingAppBundleIdentifier = %@", result);
-                    return result;
-                }
+                if (result.length) return result;
             }
         } @catch (NSException *e) {}
 
@@ -167,10 +186,7 @@ static NSString *extractIdentifier(id proxy) {
         @try {
             if ([activity respondsToSelector:@selector(activityType)]) {
                 result = [activity valueForKey:@"activityType"];
-                if (result.length) {
-                    NSLog(@"[CustomShareIcon] 提取 activityType = %@", result);
-                    return result;
-                }
+                if (result.length) return result;
             }
         } @catch (NSException *e) {}
     }
@@ -182,14 +198,17 @@ static NSString *extractIdentifier(id proxy) {
         }
     } @catch (NSException *e) {}
 
+    // 从 description 里直接找已配置的 key
     @try {
-        NSString *desc = [proxy description];
-        if ([desc.lowercaseString containsString:@"airdrop"]) {
-            return @"com.apple.AirDrop";
+        NSString *desc = [[proxy description] lowercaseString];
+        for (NSString *key in customIconsDict) {
+            if (key.length && [desc containsString:key.lowercaseString]) {
+                return key;
+            }
         }
+        if ([desc containsString:@"airdrop"]) return @"com.apple.AirDrop";
     } @catch (NSException *e) {}
 
-    NSLog(@"[CustomShareIcon] ⚠️ 提取失败 proxy=%@", proxy);
     return nil;
 }
 
@@ -213,8 +232,6 @@ static BOOL isInShareSheetContext(UIView *view) {
     }
     return NO;
 }
-
-#pragma mark - 主面板
 
 %hook UIShareGroupActivityCell
 
@@ -346,7 +363,6 @@ static BOOL isInShareSheetContext(UIView *view) {
 
     [self.contentView bringSubviewToFront:customIv];
 
-    // 强制把 badge 置顶
     if (badgeView) {
         [self.contentView bringSubviewToFront:badgeView];
     }
@@ -359,8 +375,6 @@ static BOOL isInShareSheetContext(UIView *view) {
 }
 
 %end
-
-#pragma mark - 「更多」列表
 
 %hook UITableViewCell
 
@@ -410,8 +424,6 @@ static BOOL isInShareSheetContext(UIView *view) {
 
 %end
 
-#pragma mark - UIActivity 拦截
-
 %hook UIActivity
 
 + (id)_activityImageForApplicationBundleIdentifier:(NSString *)identifier {
@@ -456,7 +468,7 @@ static BOOL isInShareSheetContext(UIView *view) {
 %end
 
 %ctor {
-    NSLog(@"[CustomShareIcon] Tweak 加载完成 (强制overlay + 对抗slot回写 + 强化偏好读取版)");
+    NSLog(@"[CustomShareIcon] Tweak 加载完成 (宽松匹配 + 强制overlay版)");
     loadPrefs();
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
                                     NULL, (CFNotificationCallback)loadPrefs,
