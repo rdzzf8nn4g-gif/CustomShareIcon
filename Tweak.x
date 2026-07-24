@@ -28,7 +28,7 @@
 static BOOL isEnabled = NO;
 static NSDictionary *customIconsDict = nil;
 static NSMutableDictionary<NSString *, UIImage *> *imageCache = nil;
-static UIImage *testRedImage = nil; // 强制测试用红色图
+static UIImage *testRedImage = nil;   // 懒加载，绝不在 %ctor 里创建
 
 static void loadPrefs() {
     CFPreferencesAppSynchronize(PREFS_DOMAIN);
@@ -45,19 +45,27 @@ static void loadPrefs() {
     }
     if (iconsRef) CFRelease(iconsRef);
 
-    if (!imageCache) imageCache = [NSMutableDictionary new];
-    else [imageCache removeAllObjects];
-
-    // 生成一张明显的红色测试图
-    if (!testRedImage) {
-        UIGraphicsBeginImageContextWithOptions(CGSizeMake(60, 60), NO, 0);
-        [[UIColor redColor] setFill];
-        UIRectFill(CGRectMake(0, 0, 60, 60));
-        testRedImage = UIGraphicsGetImageFromCurrentImageContext();
-        UIGraphicsEndImageContext();
+    if (!imageCache) {
+        imageCache = [[NSMutableDictionary alloc] init];
+    } else {
+        [imageCache removeAllObjects];
     }
 
     NSLog(@"[CustomShareIcon] loadPrefs enabled=%d count=%lu", isEnabled, (unsigned long)(customIconsDict ? customIconsDict.count : 0));
+}
+
+// 懒加载红色测试图（只在真正需要时、主线程创建）
+static UIImage *getTestRedImage() {
+    if (testRedImage) return testRedImage;
+
+    // 使用固定 scale，避免依赖 UIScreen
+    UIGraphicsBeginImageContextWithOptions(CGSizeMake(60, 60), NO, 3.0);
+    [[UIColor redColor] setFill];
+    UIRectFill(CGRectMake(0, 0, 60, 60));
+    testRedImage = UIGraphicsGetImageFromCurrentImageContext();
+    UIGraphicsEndImageContext();
+
+    return testRedImage;
 }
 
 static UIImage *getCustomIconForID(NSString *identifier) {
@@ -79,7 +87,7 @@ static UIImage *getCustomIconForID(NSString *identifier) {
     NSData *data = [[NSData alloc] initWithBase64EncodedString:base64Str options:0];
     if (!data) return nil;
 
-    UIImage *img = [UIImage imageWithData:data scale:UIScreen.mainScreen.scale];
+    UIImage *img = [UIImage imageWithData:data scale:3.0]; // 固定 scale，安全
     if (img) {
         imageCache[identifier] = img;
         NSLog(@"[CustomShareIcon] 加载成功 → %@", identifier);
@@ -179,9 +187,9 @@ static NSString *extractIdentifier(id proxy) {
         NSLog(@"[CustomShareIcon] 提取失败，使用红色测试图 proxy=%@", proxy);
     }
 
-    // 如果没匹配到自定义图，就强制用红色测试图（验证 overlay 是否生效）
+    // 没匹配到就用红色测试图（懒加载，安全）
     if (!customImage) {
-        customImage = testRedImage;
+        customImage = getTestRedImage();
     }
 
     UIView *slotView = [strongSelf valueForKey:@"imageSlotView"];
@@ -268,7 +276,7 @@ static NSString *extractIdentifier(id proxy) {
 %end
 
 %ctor {
-    NSLog(@"[CustomShareIcon] Tweak 加载完成 (强制红色测试版)");
+    NSLog(@"[CustomShareIcon] Tweak 加载完成 (安全懒加载红色测试版)");
     loadPrefs();
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
                                     NULL, (CFNotificationCallback)loadPrefs,
