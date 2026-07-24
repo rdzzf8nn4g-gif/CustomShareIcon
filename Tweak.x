@@ -1,14 +1,5 @@
 #import <UIKit/UIKit.h>
 
-#if __has_include(<roothide.h>)
-#import <roothide.h>
-#else
-#define jbroot(path) path
-#endif
-
-// =======================
-// 声明私有类
-// =======================
 @interface UIShareGroupActivityCell : UICollectionViewCell
 - (id)activityProxy;
 - (UIImageView *)activityImageView;
@@ -27,63 +18,55 @@
 - (UIView *)imageSlotView;
 @end
 
-// =======================
-// 全局常量与状态
-// =======================
 #define TAG_CUSTOM_ICON 998877
 
-static NSString * GetMediaDir() {
-    NSString *base = @"/var/mobile/Library/Preferences/com.iosdump.customshareicon.media";
-#if __has_include(<roothide.h>)
-    return jbroot(base);
-#else
-    if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/jb/"]) {
-        return [@"/var/jb" stringByAppendingPathComponent:base];
-    }
-    return base;
-#endif
-}
-
 static BOOL isEnabled = NO;
+static NSDictionary *customIconsDict = nil;
 
+// =======================
+// 核心：使用 IPC (CFPreferences) 获取数据，沙盒无法拦截！
+// =======================
 static void loadPrefs() {
-    NSString *flagPath = [GetMediaDir() stringByAppendingPathComponent:@"enabled.txt"];
-    if ([[NSFileManager defaultManager] fileExistsAtPath:flagPath]) {
-        NSString *val = [NSString stringWithContentsOfFile:flagPath encoding:NSUTF8StringEncoding error:nil];
-        isEnabled = [val isEqualToString:@"1"];
+    CFStringRef appID = CFSTR("com.iosdump.customshareicon");
+    CFPreferencesAppSynchronize(appID);
+    
+    // 读取开关
+    id enabledVal = (__bridge_transfer id)CFPreferencesCopyAppValue(CFSTR("Enabled"), appID);
+    isEnabled = enabledVal ? [enabledVal boolValue] : NO;
+    
+    // 读取 Base64 图片字典
+    id iconsVal = (__bridge_transfer id)CFPreferencesCopyAppValue(CFSTR("CustomIcons"), appID);
+    if ([iconsVal isKindOfClass:[NSDictionary class]]) {
+        customIconsDict = iconsVal;
     } else {
-        isEnabled = NO;
+        customIconsDict = nil;
     }
 }
 
-// =======================
-// 核心逻辑：获取与匹配自定义图片
-// =======================
+// 从 Base64 还原图片并智能匹配 BundleID
 static UIImage *getCustomIconForID(NSString *identifier) {
-    if (!identifier || identifier.length == 0) return nil;
-    NSString *dir = GetMediaDir();
+    if (!identifier || identifier.length == 0 || !customIconsDict) return nil;
     
-    // 1. 精确匹配
-    NSString *exactPath = [[dir stringByAppendingPathComponent:identifier] stringByAppendingPathExtension:@"png"];
-    if ([[NSFileManager defaultManager] fileExistsAtPath:exactPath]) {
-        return [UIImage imageWithContentsOfFile:exactPath];
-    }
+    NSString *base64Str = nil;
     
-    // 2. 智能模糊匹配 (核心修复：使用 containsString)
-    NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil];
-    for (NSString *file in files) {
-        if ([file hasSuffix:@".png"]) {
-            NSString *confID = [file stringByDeletingPathExtension]; 
-            if (confID.length > 0 && [identifier containsString:confID]) {
-                NSString *path = [dir stringByAppendingPathComponent:file];
-                return [UIImage imageWithContentsOfFile:path];
+    if (customIconsDict[identifier]) {
+        base64Str = customIconsDict[identifier]; // 精确匹配
+    } else {
+        for (NSString *key in customIconsDict.allKeys) { // 智能包含匹配 (比如微信)
+            if (key.length > 0 && [identifier containsString:key]) {
+                base64Str = customIconsDict[key];
+                break;
             }
         }
+    }
+    
+    if (base64Str) {
+        NSData *data = [[NSData alloc] initWithBase64EncodedString:base64Str options:0];
+        if (data) return [UIImage imageWithData:data];
     }
     return nil;
 }
 
-// 从 Cell 的代理层级中提取 Bundle ID
 static UIImage *getCustomIconForCell(id cell) {
     if (!isEnabled) return nil;
     if (![cell respondsToSelector:@selector(activityProxy)]) return nil;
@@ -92,7 +75,6 @@ static UIImage *getCustomIconForCell(id cell) {
     if (!proxy) return nil;
     
     NSString *identifier = nil;
-    
     if ([proxy respondsToSelector:NSSelectorFromString(@"applicationBundleIdentifier")]) {
         identifier = [proxy valueForKey:@"applicationBundleIdentifier"];
     }
@@ -121,18 +103,31 @@ static UIImage *getCustomIconForCell(id cell) {
     return nil;
 }
 
-// =======================
-// 终极 UI 覆盖大法：创建一个新图层压在上面
-// =======================
+// 暴力摧毁所有可能导致原生图层显示的系统控件
+static void killSystemLayers(UICollectionViewCell *cell) {
+    // 隐藏指定属性图层
+    if ([cell respondsToSelector:@selector(imageSlotView)]) {
+        UIView *sv = [cell valueForKey:@"imageSlotView"];
+        if (sv) { sv.hidden = YES; sv.alpha = 0; }
+    }
+    if ([cell respondsToSelector:@selector(activityImageView)]) {
+        UIView *iv = [cell valueForKey:@"activityImageView"];
+        if (iv) { iv.hidden = YES; iv.alpha = 0; }
+    }
+    
+    // 循环遍历揪出所有跨进程 Remote 图层并干掉
+    for (UIView *subview in cell.contentView.subviews) {
+        NSString *className = NSStringFromClass([subview class]);
+        if ([className containsString:@"Slot"] || [className containsString:@"Remote"] || [className containsString:@"Host"]) {
+            subview.hidden = YES;
+            subview.alpha = 0;
+        }
+    }
+}
+
 static void applyCustomImageToCell(UICollectionViewCell *cell, UIImage *customImage) {
-    UIView *slotView = [cell respondsToSelector:@selector(imageSlotView)] ? [cell valueForKey:@"imageSlotView"] : nil;
-    UIImageView *appleIv = [cell respondsToSelector:@selector(activityImageView)] ? [cell valueForKey:@"activityImageView"] : nil;
+    killSystemLayers(cell);
     
-    // 1. 无情打压系统的图层
-    if (slotView) { slotView.hidden = YES; slotView.alpha = 0; }
-    if (appleIv) { appleIv.hidden = YES; appleIv.alpha = 0; }
-    
-    // 2. 创建或更新我们自己的ImageView
     UIImageView *customIv = [cell.contentView viewWithTag:TAG_CUSTOM_ICON];
     if (!customIv) {
         customIv = [[UIImageView alloc] init];
@@ -142,37 +137,28 @@ static void applyCustomImageToCell(UICollectionViewCell *cell, UIImage *customIm
         
         if ([NSStringFromClass([cell class]) containsString:@"Action"]) {
             customIv.layer.cornerRadius = 0;
+            customIv.frame = CGRectMake((cell.contentView.bounds.size.width - 28)/2, 16, 28, 28);
         } else {
             customIv.layer.cornerRadius = 13.0; 
+            customIv.frame = CGRectMake((cell.contentView.bounds.size.width - 60)/2, 0, 60, 60);
         }
         [cell.contentView addSubview:customIv];
     }
     
-    // 3. 动态获取坐标与大小
-    CGRect targetFrame = CGRectZero;
-    if (slotView && !CGRectIsEmpty(slotView.frame)) {
-        targetFrame = slotView.frame;
-    } else if (appleIv && !CGRectIsEmpty(appleIv.frame)) {
-        targetFrame = appleIv.frame;
-    } else {
-        if ([NSStringFromClass([cell class]) containsString:@"Action"]) {
-            targetFrame = CGRectMake((cell.contentView.bounds.size.width - 28)/2, 16, 28, 28);
-        } else {
-            targetFrame = CGRectMake((cell.contentView.bounds.size.width - 60)/2, 0, 60, 60);
-        }
-    }
-    
-    customIv.frame = targetFrame;
+    [cell.contentView bringSubviewToFront:customIv]; // 强行拉到最顶层
     customIv.image = customImage;
     customIv.hidden = NO;
 }
 
 static void restoreCell(UICollectionViewCell *cell) {
-    UIView *slotView = [cell respondsToSelector:@selector(imageSlotView)] ? [cell valueForKey:@"imageSlotView"] : nil;
-    UIImageView *appleIv = [cell respondsToSelector:@selector(activityImageView)] ? [cell valueForKey:@"activityImageView"] : nil;
-    
-    if (slotView) { slotView.hidden = NO; slotView.alpha = 1.0; }
-    if (appleIv) { appleIv.hidden = NO; appleIv.alpha = 1.0; }
+    if ([cell respondsToSelector:@selector(imageSlotView)]) {
+        UIView *sv = [cell valueForKey:@"imageSlotView"];
+        if (sv) { sv.hidden = NO; sv.alpha = 1.0; }
+    }
+    if ([cell respondsToSelector:@selector(activityImageView)]) {
+        UIView *iv = [cell valueForKey:@"activityImageView"];
+        if (iv) { iv.hidden = NO; iv.alpha = 1.0; }
+    }
     
     UIView *customIv = [cell.contentView viewWithTag:TAG_CUSTOM_ICON];
     if (customIv) {
@@ -180,19 +166,11 @@ static void restoreCell(UICollectionViewCell *cell) {
     }
 }
 
-// =======================
-// 手动展开 Hook (避开宏解析报错)
-// =======================
-
 %hook UIShareGroupActivityCell
 - (void)layoutSubviews {
     %orig;
     UIImage *custom = getCustomIconForCell(self);
-    if (custom) {
-        applyCustomImageToCell(self, custom);
-    } else {
-        restoreCell(self);
-    }
+    if (custom) { applyCustomImageToCell(self, custom); } else { restoreCell(self); }
 }
 %end
 
@@ -200,11 +178,7 @@ static void restoreCell(UICollectionViewCell *cell) {
 - (void)layoutSubviews {
     %orig;
     UIImage *custom = getCustomIconForCell(self);
-    if (custom) {
-        applyCustomImageToCell(self, custom);
-    } else {
-        restoreCell(self);
-    }
+    if (custom) { applyCustomImageToCell(self, custom); } else { restoreCell(self); }
 }
 %end
 
@@ -212,11 +186,7 @@ static void restoreCell(UICollectionViewCell *cell) {
 - (void)layoutSubviews {
     %orig;
     UIImage *custom = getCustomIconForCell(self);
-    if (custom) {
-        applyCustomImageToCell(self, custom);
-    } else {
-        restoreCell(self);
-    }
+    if (custom) { applyCustomImageToCell(self, custom); } else { restoreCell(self); }
 }
 %end
 
