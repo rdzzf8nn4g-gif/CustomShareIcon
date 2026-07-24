@@ -2,16 +2,12 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>Filter</key>
-    <dict>
-        <key>Bundles</key>
-        <array>
-            <string>com.apple.UIKit</string>
-            <string>com.apple.UIKitCore</string>
-            <string>com.apple.SpringBoard</string>
-            <string>com.apple.ShareSheet</string>
-            <string>com.apple.Sharing</string>
-        </array>
-    </dict>
+	<key>Filter</key>
+	<dict>
+		<key>Bundles</key>
+		<array>
+			<string>com.apple.Sharing</string>
+		</array>
+	</dict>
 </dict>
 </plist>
