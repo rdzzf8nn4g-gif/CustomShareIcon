@@ -2,7 +2,7 @@
 #import <objc/runtime.h>
 
 #define TAG_CUSTOM_ICON 998877
-#define PREFS_DOMAIN CFSTR("com.iosdump.customshareicon")
+#define PREFS_ID @"com.iosdump.customshareicon"
 
 @interface UIShareGroupActivityCell : UICollectionViewCell
 @property (nonatomic, strong) id activityProxy;
@@ -31,43 +31,48 @@ static NSDictionary *customIconsDict = nil;
 static NSMutableDictionary<NSString *, UIImage *> *imageCache = nil;
 
 static void loadPrefs() {
-    CFPreferencesAppSynchronize(PREFS_DOMAIN);
+    NSUserDefaults *defaults = [[NSUserDefaults alloc] initWithSuiteName:PREFS_ID];
+    [defaults synchronize];
 
-    id enabledVal = (__bridge_transfer id)CFPreferencesCopyAppValue(CFSTR("Enabled"), PREFS_DOMAIN);
-    isEnabled = enabledVal ? [enabledVal boolValue] : NO;
-
-    id iconsVal = (__bridge_transfer id)CFPreferencesCopyAppValue(CFSTR("IOSDump_CSI_Icons"), PREFS_DOMAIN);
+    isEnabled = [defaults boolForKey:@"Enabled"];
+    
+    id iconsVal = [defaults objectForKey:@"IOSDump_CSI_Icons"];
     if ([iconsVal isKindOfClass:[NSDictionary class]]) {
         customIconsDict = [iconsVal copy];
     } else {
         customIconsDict = nil;
     }
 
-    if (!imageCache) imageCache = [NSMutableDictionary new];
-    else [imageCache removeAllObjects];
+    if (!imageCache) {
+        imageCache = [[NSMutableDictionary alloc] init];
+    } else {
+        [imageCache removeAllObjects];
+    }
 
-    NSLog(@"[CustomShareIcon] loadPrefs enabled=%d count=%lu", isEnabled, (unsigned long)customIconsDict.count);
+    NSLog(@"[CustomShareIcon] loadPrefs enabled=%d count=%lu", isEnabled, (unsigned long)(customIconsDict ? customIconsDict.count : 0));
 }
 
 static UIImage *getCustomIconForID(NSString *identifier) {
-    if (!isEnabled || !identifier.length || !customIconsDict) return nil;
+    if (!isEnabled || !identifier || identifier.length == 0 || !customIconsDict) return nil;
+
     if (imageCache[identifier]) return imageCache[identifier];
 
     NSString *base64Str = customIconsDict[identifier];
     if (!base64Str) {
-        for (NSString *key in customIconsDict) {
-            if (key.length && ([identifier containsString:key] || [key containsString:identifier])) {
+        for (NSString *key in customIconsDict.allKeys) {
+            if (key.length > 0 && ([identifier containsString:key] || [key containsString:identifier])) {
                 base64Str = customIconsDict[key];
                 break;
             }
         }
     }
+
     if (!base64Str) return nil;
 
     NSData *data = [[NSData alloc] initWithBase64EncodedString:base64Str options:0];
     if (!data) return nil;
 
-    UIImage *img = [UIImage imageWithData:data scale:UIScreen.mainScreen.scale];
+    UIImage *img = [UIImage imageWithData:data scale:[UIScreen mainScreen].scale];
     if (img) {
         imageCache[identifier] = img;
         NSLog(@"[CustomShareIcon] 加载成功 → %@", identifier);
@@ -77,42 +82,53 @@ static UIImage *getCustomIconForID(NSString *identifier) {
 
 static NSString *extractIdentifier(id proxy) {
     if (!proxy) return nil;
+
     NSString *result = nil;
 
-    // iOS 16+ 
+    // iOS 16+ 最优先
     if ([proxy respondsToSelector:@selector(applicationBundleIdentifier)]) {
         result = [proxy valueForKey:@"applicationBundleIdentifier"];
-        if (result.length) return result;
+        if (result.length > 0) return result;
     }
 
-    id activity = [proxy respondsToSelector:@selector(activity)] ? [proxy valueForKey:@"activity"] : nil;
+    id activity = nil;
+    if ([proxy respondsToSelector:@selector(activity)]) {
+        activity = [proxy valueForKey:@"activity"];
+    }
+
     if (activity) {
         if ([activity respondsToSelector:@selector(containingAppBundleIdentifier)]) {
             result = [activity valueForKey:@"containingAppBundleIdentifier"];
-            if (result.length) return result;
+            if (result.length > 0) return result;
         }
+
         if ([activity respondsToSelector:@selector(applicationExtension)]) {
             id ext = [activity valueForKey:@"applicationExtension"];
             if (ext) {
-                result = [ext valueForKey:@"identifier"];
-                if (result.length) return result;
+                if ([ext respondsToSelector:@selector(identifier)]) {
+                    result = [ext valueForKey:@"identifier"];
+                    if (result.length > 0) return result;
+                }
                 id bundle = [ext valueForKey:@"_bundle"];
-                if (bundle) {
+                if (bundle && [bundle respondsToSelector:@selector(bundleIdentifier)]) {
                     result = [bundle bundleIdentifier];
-                    if (result.length) return result;
+                    if (result.length > 0) return result;
                 }
             }
         }
+
         if ([activity respondsToSelector:@selector(activityType)]) {
             result = [activity valueForKey:@"activityType"];
-            if (result.length) return result;
+            if (result.length > 0) return result;
         }
     }
 
+    // 最后兜底
     if ([proxy respondsToSelector:@selector(activityType)]) {
         result = [proxy valueForKey:@"activityType"];
-        if (result.length) return result;
+        if (result.length > 0) return result;
     }
+
     return nil;
 }
 
@@ -140,15 +156,23 @@ static NSString *extractIdentifier(id proxy) {
 
 - (void)prepareForReuse {
     %orig;
+
     UIImageView *customIv = [self.contentView viewWithTag:TAG_CUSTOM_ICON];
     if (customIv) {
         customIv.hidden = YES;
         customIv.image = nil;
     }
+
     UIView *slotView = [self valueForKey:@"imageSlotView"];
     UIView *nativeIv = [self valueForKey:@"activityImageView"];
-    if (slotView) { slotView.hidden = NO; slotView.alpha = 1; }
-    if (nativeIv) { nativeIv.hidden = NO; nativeIv.alpha = 1; }
+    if (slotView) {
+        slotView.hidden = NO;
+        slotView.alpha = 1.0;
+    }
+    if (nativeIv) {
+        nativeIv.hidden = NO;
+        nativeIv.alpha = 1.0;
+    }
 }
 
 %new
@@ -163,19 +187,21 @@ static NSString *extractIdentifier(id proxy) {
     if (!proxy) return;
 
     NSString *identifier = extractIdentifier(proxy);
-    if (!identifier.length) {
+    if (!identifier || identifier.length == 0) {
         NSLog(@"[CustomShareIcon] 提取失败 proxy=%@", proxy);
         return;
     }
+
     NSLog(@"[CustomShareIcon] identifier = %@", identifier);
 
     UIImage *customImage = getCustomIconForID(identifier);
+
     UIView *slotView = [strongSelf valueForKey:@"imageSlotView"];
     UIImageView *nativeIv = [strongSelf valueForKey:@"activityImageView"];
     UIImageView *customIv = [strongSelf.contentView viewWithTag:TAG_CUSTOM_ICON];
 
     if (customImage) {
-        // 路径1：直接替换原生 imageView（最稳）
+        // 路径1：直接替换原生 imageView
         if (nativeIv && [nativeIv isKindOfClass:[UIImageView class]]) {
             nativeIv.image = customImage;
             nativeIv.hidden = NO;
@@ -186,38 +212,50 @@ static NSString *extractIdentifier(id proxy) {
         // 路径2：强力 overlay（对抗 slot 覆盖）
         if (slotView) {
             slotView.hidden = YES;
-            slotView.alpha = 0;
+            slotView.alpha = 0.0;
         }
 
         if (!customIv) {
-            customIv = [UIImageView new];
+            customIv = [[UIImageView alloc] init];
             customIv.tag = TAG_CUSTOM_ICON;
             customIv.contentMode = UIViewContentModeScaleAspectFit;
             customIv.clipsToBounds = YES;
             customIv.userInteractionEnabled = NO;
             [strongSelf.contentView addSubview:customIv];
         }
+
         [strongSelf.contentView bringSubviewToFront:customIv];
 
         UIView *ref = (nativeIv && !CGRectIsEmpty(nativeIv.frame)) ? nativeIv : slotView;
         if (ref && !CGRectIsEmpty(ref.frame)) {
             customIv.frame = ref.frame;
-            customIv.layer.cornerRadius = ref.layer.cornerRadius > 0 ? ref.layer.cornerRadius : 13.0;
+            CGFloat radius = ref.layer.cornerRadius;
+            customIv.layer.cornerRadius = radius > 0 ? radius : 13.0;
         } else {
-            BOOL isAction = [NSStringFromClass(strongSelf.class) containsString:@"Action"];
-            CGFloat s = isAction ? 28.0 : 60.0;
-            customIv.frame = CGRectMake((strongSelf.contentView.bounds.size.width - s)/2.0, isAction ? 16 : 0, s, s);
-            customIv.layer.cornerRadius = isAction ? 0 : 13.0;
+            BOOL isAction = [NSStringFromClass([strongSelf class]) rangeOfString:@"Action"].location != NSNotFound;
+            CGFloat size = isAction ? 28.0 : 60.0;
+            CGFloat y = isAction ? 16.0 : 0.0;
+            customIv.frame = CGRectMake((strongSelf.contentView.bounds.size.width - size) / 2.0, y, size, size);
+            customIv.layer.cornerRadius = isAction ? 0.0 : 13.0;
         }
+
         customIv.image = customImage;
         customIv.hidden = NO;
         customIv.alpha = 1.0;
 
         NSLog(@"[CustomShareIcon] 已强制替换图标 → %@", identifier);
     } else {
-        if (slotView) { slotView.hidden = NO; slotView.alpha = 1; }
-        if (nativeIv) { nativeIv.hidden = NO; nativeIv.alpha = 1; }
-        if (customIv) customIv.hidden = YES;
+        if (slotView) {
+            slotView.hidden = NO;
+            slotView.alpha = 1.0;
+        }
+        if (nativeIv) {
+            nativeIv.hidden = NO;
+            nativeIv.alpha = 1.0;
+        }
+        if (customIv) {
+            customIv.hidden = YES;
+        }
     }
 }
 
@@ -227,11 +265,14 @@ static NSString *extractIdentifier(id proxy) {
 
 + (id)_activityImageForApplicationBundleIdentifier:(NSString *)identifier {
     UIImage *custom = getCustomIconForID(identifier);
-    return custom ?: %orig;
+    if (custom) {
+        NSLog(@"[CustomShareIcon] UIActivity class method 拦截成功 → %@", identifier);
+        return custom;
+    }
+    return %orig;
 }
 
 + (id)_activityImageForBundleImageConfiguration:(id)configuration {
-    // 尝试从 configuration 里拿 bundle id
     NSString *bid = nil;
     if ([configuration respondsToSelector:@selector(bundleIdentifier)]) {
         bid = [configuration valueForKey:@"bundleIdentifier"];
@@ -241,25 +282,40 @@ static NSString *extractIdentifier(id proxy) {
 }
 
 + (id)_imageByApplyingDefaultEffectsToImage:(id)image activityCategory:(long long)category iconFormat:(int)format {
-    // 如果已经是自定义图，直接返回，避免系统再加工
     return %orig;
 }
 
 - (UIImage *)activityImage {
-    NSString *type = [self respondsToSelector:@selector(activityType)] ? [self activityType] : nil;
+    NSString *type = nil;
+    if ([self respondsToSelector:@selector(activityType)]) {
+        type = [self activityType];
+    }
     UIImage *custom = getCustomIconForID(type);
-    return custom ?: %orig;
+    if (custom) {
+        NSLog(@"[CustomShareIcon] activityImage 拦截成功 → %@", type);
+        return custom;
+    }
+    return %orig;
 }
 
 - (UIImage *)_activityImage {
-    NSString *type = [self respondsToSelector:@selector(activityType)] ? [self activityType] : nil;
+    NSString *type = nil;
+    if ([self respondsToSelector:@selector(activityType)]) {
+        type = [self activityType];
+    }
     UIImage *custom = getCustomIconForID(type);
-    return custom ?: %orig;
+    if (custom) return custom;
+    return %orig;
 }
 
 - (NSString *)_systemImageName {
-    NSString *type = [self respondsToSelector:@selector(activityType)] ? [self activityType] : nil;
-    if (getCustomIconForID(type)) return nil;
+    NSString *type = nil;
+    if ([self respondsToSelector:@selector(activityType)]) {
+        type = [self activityType];
+    }
+    if (getCustomIconForID(type)) {
+        return nil;
+    }
     return %orig;
 }
 
@@ -276,16 +332,22 @@ static NSString *extractIdentifier(id proxy) {
         bid = [self activityType];
     }
     UIImage *custom = getCustomIconForID(bid);
-    return custom ?: %orig;
+    if (custom) {
+        NSLog(@"[CustomShareIcon] UIApplicationExtensionActivity 拦截成功 → %@", bid);
+        return custom;
+    }
+    return %orig;
 }
 
 %end
 
 %ctor {
-    NSLog(@"[CustomShareIcon] Tweak 加载完成 (iOS14-17+ 最终兼容版)");
+    NSLog(@"[CustomShareIcon] Tweak 加载完成 (NSUserDefaults 最终版)");
     loadPrefs();
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
-                                    NULL, (CFNotificationCallback)loadPrefs,
+                                    NULL,
+                                    (CFNotificationCallback)loadPrefs,
                                     CFSTR("com.iosdump.customshareicon/ReloadPrefs"),
-                                    NULL, CFNotificationSuspensionBehaviorCoalesce);
+                                    NULL,
+                                    CFNotificationSuspensionBehaviorCoalesce);
 }
