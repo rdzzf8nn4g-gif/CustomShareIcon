@@ -7,11 +7,12 @@
 #endif
 
 // =======================
-// 声明要 Hook 的私有类，避免编译器找不到类型
+// 声明要 Hook 的类，避免编译器找不到类型
 // =======================
 @interface UIShareGroupActivityCell : UICollectionViewCell
 - (id)activityProxy;
 - (UIImageView *)activityImageView;
+- (UIView *)imageSlotView; // iOS 16+ 跨进程映射图层
 @end
 
 @interface UIActivityGroupActivityCell : UICollectionViewCell
@@ -22,12 +23,6 @@
 @interface UIActivityActionGroupCell : UICollectionViewCell
 - (id)activityProxy;
 - (UIImageView *)activityImageView;
-@end
-
-@protocol CSIActivityProtocol <NSObject>
-@optional
-- (NSString *)containingAppBundleIdentifier;
-- (NSString *)activityType;
 @end
 
 
@@ -65,7 +60,9 @@ static void loadPrefs() {
     isEnabled = dict[@"Enabled"] ? [dict[@"Enabled"] boolValue] : NO;
 }
 
-// 核心查找图片：支持前缀匹配
+// =======================
+// 核心读取与匹配逻辑
+// =======================
 static UIImage *getCustomIconForID(NSString *identifier) {
     if (!identifier || identifier.length == 0) return nil;
     NSString *dir = GetMediaDir();
@@ -76,7 +73,7 @@ static UIImage *getCustomIconForID(NSString *identifier) {
         return [UIImage imageWithContentsOfFile:exactPath];
     }
     
-    // 2. 智能前缀匹配
+    // 2. 智能前缀匹配 (针对 com.tencent.xin.shareextension)
     NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil];
     for (NSString *file in files) {
         if ([file hasSuffix:@".png"]) {
@@ -97,24 +94,54 @@ static UIImage *getCustomIconForCell(id cell) {
     id proxy = [cell performSelector:@selector(activityProxy)];
     if (!proxy) return nil;
     
-    NSString *actType = nil;
-    if ([proxy respondsToSelector:NSSelectorFromString(@"activityType")]) {
-        actType = [proxy valueForKey:@"activityType"];
+    NSString *identifier = nil;
+    
+    // 优先 1：读取 iOS 16-17 _UIHostActivityProxy 特有的 applicationBundleIdentifier
+    if ([proxy respondsToSelector:NSSelectorFromString(@"applicationBundleIdentifier")]) {
+        identifier = [proxy valueForKey:@"applicationBundleIdentifier"];
     }
     
-    if (actType) {
-        return getCustomIconForID(actType);
+    // 优先 2：深入读取原始 activity 的 identifier (兼容 iOS 14-15)
+    if ((!identifier || identifier.length == 0) && [proxy respondsToSelector:NSSelectorFromString(@"activity")]) {
+        id activity = [proxy valueForKey:@"activity"];
+        if (activity) {
+            if ([activity respondsToSelector:NSSelectorFromString(@"containingAppBundleIdentifier")]) {
+                identifier = [activity valueForKey:@"containingAppBundleIdentifier"];
+            }
+            if (!identifier || identifier.length == 0) {
+                if ([activity respondsToSelector:NSSelectorFromString(@"activityType")]) {
+                    identifier = [activity valueForKey:@"activityType"];
+                }
+            }
+        }
+    }
+    
+    if (identifier) {
+        return getCustomIconForID(identifier);
     }
     return nil;
 }
 
+// 核心杀手锏：接管视图并抹除跨进程 Slot 映射
 static void handleCellUpdate(id cell) {
     UIImage *custom = getCustomIconForCell(cell);
     if (custom) {
+        // 1. 隐藏 iOS 16+ 的跨进程渲染图层 (SlotView)，这是图标死活不生效的罪魁祸首！
+        if ([cell respondsToSelector:@selector(imageSlotView)]) {
+            UIView *slotView = [cell performSelector:@selector(imageSlotView)];
+            if (slotView && [slotView isKindOfClass:[UIView class]]) {
+                slotView.hidden = YES;
+                slotView.alpha = 0;
+            }
+        }
+        
+        // 2. 强行把我们的图片设置给底层的 activityImageView 并确保显示
         if ([cell respondsToSelector:@selector(activityImageView)]) {
             UIImageView *iv = [cell performSelector:@selector(activityImageView)];
             if (iv && [iv isKindOfClass:[UIImageView class]]) {
-                iv.image = custom; // 强行替换视图
+                iv.image = custom;
+                iv.hidden = NO;
+                iv.alpha = 1.0;
             }
         }
     }
@@ -122,7 +149,7 @@ static void handleCellUpdate(id cell) {
 
 
 // =======================
-// Cell UI 层拦截模块 (手动展开宏，完美兼容 Logos 编译器)
+// Cell UI 渲染劫持模块
 // =======================
 
 %hook UIShareGroupActivityCell
@@ -179,71 +206,6 @@ static void handleCellUpdate(id cell) {
 - (void)layoutSubviews {
     %orig;
     handleCellUpdate(self);
-}
-%end
-
-
-// =======================
-// 数据源层拦截模块 (备用，兜底原生功能)
-// =======================
-
-static NSString *getIdentifierForActivity(id<CSIActivityProtocol> activity) {
-    NSString *identifier = nil;
-    if ([activity respondsToSelector:@selector(containingAppBundleIdentifier)]) {
-        identifier = [activity containingAppBundleIdentifier];
-    }
-    if (!identifier || identifier.length == 0) {
-        if ([activity respondsToSelector:@selector(activityType)]) {
-            identifier = [activity activityType];
-        }
-    }
-    return identifier;
-}
-
-%hook UIActivity
-- (UIImage *)activityImage {
-    if (isEnabled) {
-        UIImage *custom = getCustomIconForID(getIdentifierForActivity((id<CSIActivityProtocol>)self));
-        if (custom) return custom;
-    }
-    return %orig;
-}
-- (UIImage *)_activityImage {
-    if (isEnabled) {
-        UIImage *custom = getCustomIconForID(getIdentifierForActivity((id<CSIActivityProtocol>)self));
-        if (custom) return custom;
-    }
-    return %orig;
-}
-- (UIImage *)_actionImage {
-    if (isEnabled) {
-        UIImage *custom = getCustomIconForID(getIdentifierForActivity((id<CSIActivityProtocol>)self));
-        if (custom) return custom;
-    }
-    return %orig;
-}
-- (NSString *)_systemImageName {
-    if (isEnabled && getCustomIconForID(getIdentifierForActivity((id<CSIActivityProtocol>)self))) {
-        return nil; // 废掉原生 SF Symbol fallback
-    }
-    return %orig;
-}
-%end
-
-%hook UIApplicationExtensionActivity
-- (UIImage *)activityImage {
-    if (isEnabled) {
-        UIImage *custom = getCustomIconForID(getIdentifierForActivity((id<CSIActivityProtocol>)self));
-        if (custom) return custom;
-    }
-    return %orig;
-}
-- (UIImage *)_activityImage {
-    if (isEnabled) {
-        UIImage *custom = getCustomIconForID(getIdentifierForActivity((id<CSIActivityProtocol>)self));
-        if (custom) return custom;
-    }
-    return %orig;
 }
 %end
 
