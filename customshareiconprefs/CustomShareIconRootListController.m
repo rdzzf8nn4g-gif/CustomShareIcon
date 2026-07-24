@@ -8,10 +8,6 @@ static NSString * GetCSIDir() {
     return @"/var/mobile/Library/Application Support/com.iosdump.customshareicon";
 }
 
-static NSString * GetPrefPath() {
-    return @"/var/mobile/Library/Preferences/com.iosdump.customshareicon.plist";
-}
-
 @implementation CustomShareIconRootListController
 
 - (void)viewDidLoad {
