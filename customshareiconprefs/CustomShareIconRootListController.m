@@ -8,10 +8,10 @@
 #endif
 
 // =======================
-// 辅助函数：获取图片存储目录
+// 核心修复：转移到所有进程都能读取的公共目录！
 // =======================
 static NSString * GetCSIDir() {
-    NSString *base = @"/var/mobile/Library/Preferences/com.iosdump.customshareicon.media";
+    NSString *base = @"/Library/Application Support/CustomShareIcon";
 #if __has_include(<roothide.h>)
     return jbroot(base);
 #else
@@ -21,22 +21,6 @@ static NSString * GetCSIDir() {
     return base;
 #endif
 }
-
-// =======================
-// 辅助函数：获取 plist 配置文件路径
-// =======================
-static NSString * GetPrefPath() {
-    NSString *base = @"/var/mobile/Library/Preferences/com.iosdump.customshareicon.plist";
-#if __has_include(<roothide.h>)
-    return jbroot(base);
-#else
-    if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/jb/"]) {
-        return [@"/var/jb" stringByAppendingPathComponent:base];
-    }
-    return base;
-#endif
-}
-
 
 @implementation CustomShareIconRootListController
 
@@ -45,7 +29,7 @@ static NSString * GetPrefPath() {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *dir = GetCSIDir();
     
-    // 如果文件夹不存在，则创建并赋予 0777 权限
+    // 初始化沙盒公共目录
     if (![fm fileExistsAtPath:dir]) {
         [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:@{NSFilePosixPermissions: @0777, NSFileProtectionKey: NSFileProtectionNone} error:nil];
     } else {
@@ -57,7 +41,6 @@ static NSString * GetPrefPath() {
     if (!_specifiers) {
         NSMutableArray *specs = [[self loadSpecifiersFromPlistName:@"Root" target:self] mutableCopy];
         
-        // 动态读取并显示已设置的自定义图标
         NSString *mediaDir = GetCSIDir();
         NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:mediaDir error:nil];
         BOOL hasIcons = NO;
@@ -90,9 +73,7 @@ static NSString * GetPrefPath() {
         [[UIApplication sharedApplication] openURL:url options:@{} completionHandler:nil];
     }
 }
-- (void)openTelegramChannel:(PSSpecifier *)spec { 
-    [self openTelegramChannel]; 
-}
+- (void)openTelegramChannel:(PSSpecifier *)spec { [self openTelegramChannel]; }
 
 - (void)addNewIcon {
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"添加自定义图标" message:@"请输入目标App的Bundle ID\n(例如微信：com.tencent.xin)" preferredStyle:UIAlertControllerStyleAlert];
@@ -120,9 +101,7 @@ static NSString * GetPrefPath() {
     [topVC presentViewController:alert animated:YES completion:nil];
 }
 
-- (void)addNewIcon:(PSSpecifier *)spec { 
-    [self addNewIcon]; 
-}
+- (void)addNewIcon:(PSSpecifier *)spec { [self addNewIcon]; }
 
 - (void)deleteIcon:(PSSpecifier *)spec {
     NSString *filename = [spec propertyForKey:@"filename"];
@@ -173,12 +152,9 @@ static NSString * GetPrefPath() {
             [itemProvider loadObjectOfClass:[UIImage class] completionHandler:^(__kindof id object, NSError *error) {
                 if ([object isKindOfClass:[UIImage class]]) {
                     UIImage *img = (UIImage *)object;
-                    // 保存为 png 格式
                     NSData *data = UIImagePNGRepresentation(img);
                     NSString *path = [GetCSIDir() stringByAppendingPathComponent:[NSString stringWithFormat:@"%@.png", self.pendingBundleID]];
                     [data writeToFile:path atomically:YES];
-                    
-                    // 核心：强制赋予图片 0777 权限，穿透 ShareSheet 沙盒
                     [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions: @0777, NSFileProtectionKey: NSFileProtectionNone} ofItemAtPath:path error:nil];
                     
                     dispatch_async(dispatch_get_main_queue(), ^{
@@ -192,7 +168,6 @@ static NSString * GetPrefPath() {
     }];
 }
 
-// 在设置单元格右侧渲染图标预览
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath {
     UITableViewCell *cell = [super tableView:tableView cellForRowAtIndexPath:indexPath];
     PSSpecifier *spec = [self specifierAtIndexPath:indexPath];
@@ -203,7 +178,7 @@ static NSString * GetPrefPath() {
         UIImage *savedImage = [UIImage imageWithContentsOfFile:path];
         if (savedImage) {
             UIImageView *previewView = [[UIImageView alloc] initWithFrame:CGRectMake(0, 0, 32, 32)];
-            previewView.contentMode = UIViewContentModeScaleAspectFit; // 保持比例
+            previewView.contentMode = UIViewContentModeScaleAspectFit;
             previewView.clipsToBounds = YES;
             previewView.layer.cornerRadius = 6;
             previewView.image = savedImage;
@@ -215,9 +190,7 @@ static NSString * GetPrefPath() {
     return cell;
 }
 
-// =======================
-// 设置值并修复权限，穿透 ShareUIService 的严格沙盒
-// =======================
+// 暴力穿透沙盒：把开关状态直接写进 Application Support 里的物理文件
 - (void)setPreferenceValue:(id)value specifier:(PSSpecifier *)specifier {
     [super setPreferenceValue:value specifier:specifier];
     if ([specifier.identifier isEqualToString:@"Enabled"]) {
@@ -225,9 +198,14 @@ static NSString * GetPrefPath() {
         CFPreferencesSetAppValue((__bridge CFStringRef)specifier.properties[@"key"], (__bridge CFPropertyListRef)value, appID);
         CFPreferencesAppSynchronize(appID);
         
-        // 核心修复：强行赋予 plist 文件 0777 权限，穿透系统服务的沙盒限制
-        NSString *prefPath = GetPrefPath();
-        [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions: @0777, NSFileProtectionKey: NSFileProtectionNone} ofItemAtPath:prefPath error:nil];
+        // 生成标志文件
+        NSString *flagPath = [GetCSIDir() stringByAppendingPathComponent:@"enabled.txt"];
+        if ([value boolValue]) {
+            [@"1" writeToFile:flagPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        } else {
+            [@"0" writeToFile:flagPath atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        }
+        [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions: @0777, NSFileProtectionKey: NSFileProtectionNone} ofItemAtPath:flagPath error:nil];
         
         CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(), CFSTR("com.iosdump.customshareicon/ReloadPrefs"), NULL, NULL, YES);
     }
