@@ -1,11 +1,5 @@
 #import <UIKit/UIKit.h>
 
-#if __has_include(<roothide.h>)
-#import <roothide.h>
-#else
-#define jbroot(path) path
-#endif
-
 @interface UIShareGroupActivityCell : UICollectionViewCell
 - (id)activityProxy;
 - (UIImageView *)activityImageView;
@@ -28,15 +22,7 @@
 // 通用定义与沙盒穿透路径 (与设置一致)
 // =======================
 static NSString * GetMediaDir() {
-    NSString *base = @"/Library/Application Support/CustomShareIcon";
-#if __has_include(<roothide.h>)
-    return jbroot(base);
-#else
-    if ([[NSFileManager defaultManager] fileExistsAtPath:@"/var/jb/"]) {
-        return [@"/var/jb" stringByAppendingPathComponent:base];
-    }
-    return base;
-#endif
+    return @"/var/mobile/Library/Application Support/com.iosdump.customshareicon";
 }
 
 static BOOL isEnabled = NO;
