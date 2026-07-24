@@ -6,12 +6,12 @@
 
 @interface UIShareGroupActivityCell : UICollectionViewCell
 @property (nonatomic, strong) id activityProxy;
-@property (nonatomic, strong) UIImage *image;               // iOS 16+
+@property (nonatomic, strong) UIImage *image;
 - (void)setActivityProxy:(id)proxy;
-- (void)setImage:(UIImage *)image;                  // iOS 16+
-- (void)_updateImageView;                           // iOS 16+
-- (void)_updateDarkening;                           // iOS 16+
-- (void)_configureImageViewForPlaceholder:(BOOL)placeholder; // iOS 17
+- (void)setImage:(UIImage *)image;
+- (void)_updateImageView;
+- (void)_updateDarkening;
+- (void)_configureImageViewForPlaceholder:(BOOL)placeholder;
 - (void)csi_applyCustomIcon;
 @end
 
@@ -62,7 +62,9 @@ static void loadPrefs() {
     if (!imageCache) imageCache = [NSMutableDictionary new];
     else [imageCache removeAllObjects];
 
-    NSLog(@"[CustomShareIcon] loadPrefs enabled=%d count=%lu", isEnabled, (unsigned long)(customIconsDict ? customIconsDict.count : 0));
+    NSLog(@"[CustomShareIcon] loadPrefs enabled=%d count=%lu keys=%@", isEnabled,
+          (unsigned long)(customIconsDict ? customIconsDict.count : 0),
+          customIconsDict.allKeys);
 }
 
 static UIImage *getTestRedImage() {
@@ -98,7 +100,7 @@ static UIImage *getCustomIconForID(NSString *identifier) {
     UIImage *img = [UIImage imageWithData:data scale:3.0];
     if (img) {
         imageCache[identifier] = img;
-        NSLog(@"[CustomShareIcon] 加载成功 → %@", identifier);
+        NSLog(@"[CustomShareIcon] ✅ 真实图标加载成功 → %@", identifier);
     }
     return img;
 }
@@ -107,42 +109,75 @@ static NSString *extractIdentifier(id proxy) {
     if (!proxy) return nil;
     NSString *result = nil;
 
-    // iOS 16/17 头文件明确有此属性
-    if ([proxy respondsToSelector:@selector(applicationBundleIdentifier)]) {
-        result = [proxy valueForKey:@"applicationBundleIdentifier"];
-        if (result.length) return result;
-    }
+    // 1. iOS 16/17 头文件明确属性
+    @try {
+        if ([proxy respondsToSelector:@selector(applicationBundleIdentifier)]) {
+            result = [proxy valueForKey:@"applicationBundleIdentifier"];
+            if (result.length) {
+                NSLog(@"[CustomShareIcon] 提取到 applicationBundleIdentifier = %@", result);
+                return result;
+            }
+        }
+    } @catch (NSException *e) {}
 
+    // 2. activity 对象
     id activity = nil;
     @try { activity = [proxy valueForKey:@"activity"]; } @catch (NSException *e) {}
 
     if (activity) {
-        if ([activity respondsToSelector:@selector(containingAppBundleIdentifier)]) {
-            result = [activity valueForKey:@"containingAppBundleIdentifier"];
-            if (result.length) return result;
-        }
-        if ([activity respondsToSelector:@selector(applicationExtension)]) {
-            id ext = [activity valueForKey:@"applicationExtension"];
-            if (ext) {
-                result = [ext valueForKey:@"identifier"];
-                if (result.length) return result;
-                id bundle = [ext valueForKey:@"_bundle"];
-                if (bundle) {
-                    result = [bundle bundleIdentifier];
-                    if (result.length) return result;
+        @try {
+            if ([activity respondsToSelector:@selector(containingAppBundleIdentifier)]) {
+                result = [activity valueForKey:@"containingAppBundleIdentifier"];
+                if (result.length) {
+                    NSLog(@"[CustomShareIcon] 提取到 containingAppBundleIdentifier = %@", result);
+                    return result;
                 }
             }
-        }
-        if ([activity respondsToSelector:@selector(activityType)]) {
-            result = [activity valueForKey:@"activityType"];
-            if (result.length) return result;
-        }
+        } @catch (NSException *e) {}
+
+        @try {
+            if ([activity respondsToSelector:@selector(applicationExtension)]) {
+                id ext = [activity valueForKey:@"applicationExtension"];
+                if (ext) {
+                    result = [ext valueForKey:@"identifier"];
+                    if (result.length) return result;
+                    id bundle = [ext valueForKey:@"_bundle"];
+                    if (bundle) {
+                        result = [bundle bundleIdentifier];
+                        if (result.length) return result;
+                    }
+                }
+            }
+        } @catch (NSException *e) {}
+
+        @try {
+            if ([activity respondsToSelector:@selector(activityType)]) {
+                result = [activity valueForKey:@"activityType"];
+                if (result.length) {
+                    NSLog(@"[CustomShareIcon] 提取到 activityType = %@", result);
+                    return result;
+                }
+            }
+        } @catch (NSException *e) {}
     }
 
-    if ([proxy respondsToSelector:@selector(activityType)]) {
-        result = [proxy valueForKey:@"activityType"];
-        if (result.length) return result;
-    }
+    // 3. 直接从 proxy 拿 activityType
+    @try {
+        if ([proxy respondsToSelector:@selector(activityType)]) {
+            result = [proxy valueForKey:@"activityType"];
+            if (result.length) return result;
+        }
+    } @catch (NSException *e) {}
+
+    // 4. 最后尝试 description 里找
+    @try {
+        NSString *desc = [proxy description];
+        if ([desc containsString:@"AirDrop"] || [desc containsString:@"airdrop"]) {
+            return @"com.apple.AirDrop";
+        }
+    } @catch (NSException *e) {}
+
+    NSLog(@"[CustomShareIcon] ⚠️ 提取失败 proxy=%@", proxy);
     return nil;
 }
 
@@ -173,21 +208,21 @@ static BOOL isInShareSheetContext(UIView *view) {
     return NO;
 }
 
-#pragma mark - 主面板（完整对应头文件方法）
+#pragma mark - 主面板（完整对应 iOS 14-17 头文件）
 
 %hook UIShareGroupActivityCell
 
 - (void)setActivityProxy:(id)proxy {
     %orig;
     [self csi_applyCustomIcon];
-    // 隔空投送等异步加载需要更长延迟
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    // 隔空投送等需要更长等待
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [self csi_applyCustomIcon];
     });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [self csi_applyCustomIcon];
     });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.7 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [self csi_applyCustomIcon];
     });
 }
@@ -197,7 +232,7 @@ static BOOL isInShareSheetContext(UIView *view) {
     [self csi_applyCustomIcon];
 }
 
-// iOS 16+ 头文件方法
+// iOS 16+ 
 - (void)setImage:(UIImage *)image {
     %orig;
     [self csi_applyCustomIcon];
@@ -213,7 +248,7 @@ static BOOL isInShareSheetContext(UIView *view) {
     [self csi_applyCustomIcon];
 }
 
-// iOS 17 头文件方法
+// iOS 17
 - (void)_configureImageViewForPlaceholder:(BOOL)placeholder {
     %orig;
     [self csi_applyCustomIcon];
@@ -221,8 +256,11 @@ static BOOL isInShareSheetContext(UIView *view) {
 
 - (void)setHighlighted:(BOOL)highlighted {
     %orig;
-    // 长按后必须重新盖
+    // 长按后强制重新覆盖
     dispatch_async(dispatch_get_main_queue(), ^{
+        [self csi_applyCustomIcon];
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [self csi_applyCustomIcon];
     });
 }
@@ -254,7 +292,7 @@ static BOOL isInShareSheetContext(UIView *view) {
     if (identifier.length) {
         customImage = getCustomIconForID(identifier);
     }
-    // 没匹配到就用红色（测试用）
+    // 没匹配到真实图标时用红色（测试路径）
     if (!customImage) {
         customImage = getTestRedImage();
     }
@@ -274,7 +312,7 @@ static BOOL isInShareSheetContext(UIView *view) {
         }
     }
 
-    // 优先直接改原生（最稳定，跟随系统圆角和大小）
+    // 优先改原生
     if (targetIv) {
         targetIv.image = customImage;
         targetIv.contentMode = UIViewContentModeScaleAspectFit;
@@ -418,7 +456,7 @@ static BOOL isInShareSheetContext(UIView *view) {
 %end
 
 %ctor {
-    NSLog(@"[CustomShareIcon] Tweak 加载完成 (长按/隔空投送修复版)");
+    NSLog(@"[CustomShareIcon] Tweak 加载完成 (iOS17 + 长按/隔空投送强化版)");
     loadPrefs();
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
                                     NULL, (CFNotificationCallback)loadPrefs,
