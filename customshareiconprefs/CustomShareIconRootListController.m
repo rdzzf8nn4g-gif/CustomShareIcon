@@ -7,6 +7,9 @@
 #define jbroot(path) path
 #endif
 
+// =======================
+// 直接物理文件路径，赋予最高读写权
+// =======================
 static NSString * GetPrefPath() {
     NSString *base = @"/var/mobile/Library/Preferences/com.iosdump.customshareicon.plist";
 #if __has_include(<roothide.h>)
@@ -29,6 +32,7 @@ static NSString * GetPrefPath() {
     if (!_specifiers) {
         NSMutableArray *specs = [[self loadSpecifiersFromPlistName:@"Root" target:self] mutableCopy];
         
+        // 直接读取物理文件
         NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:GetPrefPath()];
         NSDictionary *icons = dict[@"CustomIcons"];
         
@@ -98,11 +102,9 @@ static NSString * GetPrefPath() {
         NSMutableDictionary *icons = [dict[@"CustomIcons"] mutableCopy] ?: [NSMutableDictionary dictionary];
         [icons removeObjectForKey:bundleID];
         dict[@"CustomIcons"] = icons;
-        [dict writeToFile:prefPath atomically:YES];
         
-        CFStringRef appID = CFSTR("com.iosdump.customshareicon");
-        CFPreferencesSetAppValue(CFSTR("CustomIcons"), (__bridge CFDictionaryRef)icons, appID);
-        CFPreferencesAppSynchronize(appID);
+        [dict writeToFile:prefPath atomically:YES];
+        [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions: @0777, NSFileProtectionKey: NSFileProtectionNone} ofItemAtPath:prefPath error:nil];
         
         [self reloadSpecifiers];
         CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(), CFSTR("com.iosdump.customshareicon/ReloadPrefs"), NULL, NULL, YES);
@@ -133,7 +135,7 @@ static NSString * GetPrefPath() {
 }
 
 // =======================
-// 核心：图片转 Base64，绕开沙盒读写隔离！
+// 核心：图片智能压缩 + Base64 直写，无视沙盒读写限制
 // =======================
 - (void)picker:(PHPickerViewController *)picker didFinishPicking:(NSArray<PHPickerResult *> *)results {
     if (results.count == 0 || !self.pendingBundleID) {
@@ -147,7 +149,18 @@ static NSString * GetPrefPath() {
             [itemProvider loadObjectOfClass:[UIImage class] completionHandler:^(__kindof id object, NSError *error) {
                 if ([object isKindOfClass:[UIImage class]]) {
                     UIImage *img = (UIImage *)object;
-                    // 压缩质量，减小 Base64 字符串体积
+                    
+                    // 智能缩放：将任意大图缩放到最大 120x120，极大降低 Base64 体积，防止撑爆进程内存
+                    CGSize size = img.size;
+                    CGFloat ratio = MIN(120.0/size.width, 120.0/size.height);
+                    if (ratio < 1.0) {
+                        CGSize newSize = CGSizeMake(size.width * ratio, size.height * ratio);
+                        UIGraphicsBeginImageContextWithOptions(newSize, NO, 2.0);
+                        [img drawInRect:CGRectMake(0, 0, newSize.width, newSize.height)];
+                        img = UIGraphicsGetImageFromCurrentImageContext();
+                        UIGraphicsEndImageContext();
+                    }
+                    
                     NSData *data = UIImageJPEGRepresentation(img, 0.8);
                     NSString *base64String = [data base64EncodedStringWithOptions:0];
                     
@@ -157,17 +170,16 @@ static NSString * GetPrefPath() {
                     
                     icons[self.pendingBundleID] = base64String;
                     dict[@"CustomIcons"] = icons;
-                    [dict writeToFile:prefPath atomically:YES];
                     
-                    // IPC 进程通信同步
-                    CFStringRef appID = CFSTR("com.iosdump.customshareicon");
-                    CFPreferencesSetAppValue(CFSTR("CustomIcons"), (__bridge CFDictionaryRef)icons, appID);
-                    CFPreferencesAppSynchronize(appID);
-                    
-                    dispatch_async(dispatch_get_main_queue(), ^{
-                        [self reloadSpecifiers];
-                        CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(), CFSTR("com.iosdump.customshareicon/ReloadPrefs"), NULL, NULL, YES);
-                    });
+                    BOOL success = [dict writeToFile:prefPath atomically:YES];
+                    if (success) {
+                        [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions: @0777, NSFileProtectionKey: NSFileProtectionNone} ofItemAtPath:prefPath error:nil];
+                        
+                        dispatch_async(dispatch_get_main_queue(), ^{
+                            [self reloadSpecifiers];
+                            CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(), CFSTR("com.iosdump.customshareicon/ReloadPrefs"), NULL, NULL, YES);
+                        });
+                    }
                 }
                 self.pendingBundleID = nil;
             }];
@@ -203,11 +215,12 @@ static NSString * GetPrefPath() {
 - (void)setPreferenceValue:(id)value specifier:(PSSpecifier *)specifier {
     [super setPreferenceValue:value specifier:specifier];
     if ([specifier.identifier isEqualToString:@"Enabled"]) {
-        CFStringRef appID = CFSTR("com.iosdump.customshareicon");
-        CFPreferencesSetAppValue((__bridge CFStringRef)specifier.properties[@"key"], (__bridge CFPropertyListRef)value, appID);
-        CFPreferencesAppSynchronize(appID);
+        NSString *prefPath = GetPrefPath();
+        NSMutableDictionary *dict = [NSMutableDictionary dictionaryWithContentsOfFile:prefPath] ?: [NSMutableDictionary dictionary];
+        dict[@"Enabled"] = value;
+        [dict writeToFile:prefPath atomically:YES];
+        [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions: @0777, NSFileProtectionKey: NSFileProtectionNone} ofItemAtPath:prefPath error:nil];
         
-        [[NSFileManager defaultManager] setAttributes:@{NSFilePosixPermissions: @0777, NSFileProtectionKey: NSFileProtectionNone} ofItemAtPath:GetPrefPath() error:nil];
         CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(), CFSTR("com.iosdump.customshareicon/ReloadPrefs"), NULL, NULL, YES);
     }
 }
