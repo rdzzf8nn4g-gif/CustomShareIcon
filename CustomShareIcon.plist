@@ -9,6 +9,7 @@
             <string>com.apple.UIKit</string>
             <string>com.apple.UIKitCore</string>
             <string>com.apple.SpringBoard</string>
+            <string>com.apple.ShareSheet</string>
             <string>com.apple.Sharing</string>
         </array>
     </dict>
