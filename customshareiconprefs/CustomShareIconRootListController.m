@@ -183,9 +183,10 @@
     if (png) {
         [self ensureDirectoryExists];
         NSString *filePath = [NSString stringWithFormat:@"%@/%@.png", [self currentLibPath], self.pendingBundleID];
-        // 将图片文件直接保存至 /Library/iosdump/ (或无根的对应路径)
+        // 将图片文件直接保存至 /Library/iosdump/
         [png writeToFile:filePath atomically:YES];
         
+        if (!self.iconsDict) self.iconsDict = [NSMutableDictionary new];
         self.iconsDict[self.pendingBundleID] = @"EXISTS";
     }
     
