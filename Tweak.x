@@ -49,7 +49,6 @@
 static BOOL isEnabled = NO;
 static NSDictionary *customIconsDict = nil;
 static NSMutableDictionary<NSString *, UIImage *> *imageCache = nil;
-static UIImage *testRedImage = nil;
 
 static void loadPrefs() {
     CFPreferencesAppSynchronize(PREFS_DOMAIN);
@@ -89,18 +88,6 @@ static void loadPrefs() {
     NSLog(@"[CustomShareIcon] loadPrefs enabled=%d count=%lu keys=%@", isEnabled,
           (unsigned long)(customIconsDict ? customIconsDict.count : 0),
           customIconsDict.allKeys ?: @[]);
-}
-
-static UIImage *getTestRedImage() {
-    if (testRedImage) return testRedImage;
-    CGFloat size = 60.0;
-    UIGraphicsBeginImageContextWithOptions(CGSizeMake(size, size), NO, 3.0);
-    UIBezierPath *path = [UIBezierPath bezierPathWithRoundedRect:CGRectMake(0, 0, size, size) cornerRadius:13.0];
-    [[UIColor redColor] setFill];
-    [path fill];
-    testRedImage = UIGraphicsGetImageFromCurrentImageContext();
-    UIGraphicsEndImageContext();
-    return testRedImage;
 }
 
 static UIImage *getCustomIconForID(NSString *identifier) {
@@ -252,7 +239,6 @@ static BOOL isInShareSheetContext(UIView *view) {
 
 %hook UIActivity
 
-// 最重要的源头：根据 Bundle ID 生成图标
 + (id)_activityImageForApplicationBundleIdentifier:(NSString *)identifier {
     UIImage *custom = getCustomIconForID(identifier);
     if (custom) {
@@ -262,13 +248,11 @@ static BOOL isInShareSheetContext(UIView *view) {
     return %orig;
 }
 
-// 通过 BundleImageConfiguration 生成图标
 + (id)_activityImageForBundleImageConfiguration:(id)configuration {
     if ([configuration isKindOfClass:NSClassFromString(@"_UIActivityBundleImageConfiguration")]) {
         NSString *bundlePath = [configuration valueForKey:@"bundlePath"];
         NSString *imageName = [configuration valueForKey:@"imageName"];
 
-        // 从 bundlePath 提取可能的 Bundle ID
         if (bundlePath.length) {
             NSString *last = [[bundlePath lastPathComponent] stringByDeletingPathExtension];
             UIImage *custom = getCustomIconForID(last);
@@ -276,7 +260,6 @@ static BOOL isInShareSheetContext(UIView *view) {
                 NSLog(@"[CustomShareIcon] 源头拦截 BundlePath → %@", last);
                 return custom;
             }
-            // 再试完整路径里是否包含配置的 key
             for (NSString *key in customIconsDict) {
                 if ([bundlePath.lowercaseString containsString:key.lowercaseString]) {
                     custom = getCustomIconForID(key);
@@ -304,7 +287,6 @@ static BOOL isInShareSheetContext(UIView *view) {
     UIImage *custom = getCustomIconForID(type);
     if (custom) return custom;
 
-    // 尝试 containingAppBundleIdentifier（ExtensionActivity）
     if ([self respondsToSelector:@selector(containingAppBundleIdentifier)]) {
         NSString *bid = [self valueForKey:@"containingAppBundleIdentifier"];
         custom = getCustomIconForID(bid);
@@ -334,7 +316,7 @@ static BOOL isInShareSheetContext(UIView *view) {
     if ([self respondsToSelector:@selector(activityType)]) {
         type = [self activityType];
     }
-    if (getCustomIconForID(type)) return nil; // 阻止系统 SF Symbol
+    if (getCustomIconForID(type)) return nil;
     return %orig;
 }
 
@@ -360,7 +342,7 @@ static BOOL isInShareSheetContext(UIView *view) {
 
 %end
 
-#pragma mark - 主面板（轻量兜底，防止 slot 回写）
+#pragma mark - 主面板（轻量兜底）
 
 %hook UIShareGroupActivityCell
 
@@ -445,8 +427,7 @@ static BOOL isInShareSheetContext(UIView *view) {
     if (identifier.length) {
         customImage = getCustomIconForID(identifier);
     }
-    // 源头已经替换成功时，这里可以不强制盖红色
-    if (!customImage) return;   // 不再无脑盖红色，避免干扰
+    if (!customImage) return;
 
     UIView *slotView = [self valueForKey:@"imageSlotView"];
     UIImageView *nativeIv = [self valueForKey:@"activityImageView"];
@@ -460,7 +441,6 @@ static BOOL isInShareSheetContext(UIView *view) {
     }
     if (!ref) return;
 
-    // 直接改原生（源头已经给了正确图片时更稳）
     if (nativeIv) {
         nativeIv.image = customImage;
         nativeIv.hidden = NO;
@@ -469,7 +449,6 @@ static BOOL isInShareSheetContext(UIView *view) {
         nativeIv.clipsToBounds = YES;
     }
 
-    // 轻量 overlay 兜底
     UIImageView *customIv = [self.contentView viewWithTag:TAG_CUSTOM_ICON];
     if (!customIv) {
         customIv = [UIImageView new];
@@ -497,15 +476,13 @@ static BOOL isInShareSheetContext(UIView *view) {
 
 %end
 
-#pragma mark - 「更多」列表轻量兜底
+#pragma mark - 「更多」列表
 
 %hook UITableViewCell
 
 - (void)layoutSubviews {
     %orig;
     if (!isEnabled || !isInShareSheetContext(self)) return;
-
-    // 源头已经处理，这里只做极轻量检查
 }
 
 - (void)prepareForReuse {
