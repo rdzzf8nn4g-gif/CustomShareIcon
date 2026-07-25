@@ -44,8 +44,6 @@ static BOOL isEnabled = NO;
 static NSDictionary *customIconsDict = nil;
 static NSMutableDictionary<NSString *, UIImage *> *imageCache = nil;
 
-#pragma mark - 简化加载（共享缓存优先）
-
 static BOOL isSpringBoardProcess() {
     NSString *bid = [NSBundle mainBundle].bundleIdentifier;
     if ([bid isEqualToString:@"com.apple.springboard"]) return YES;
@@ -57,11 +55,9 @@ static void writeSharedCache(NSDictionary *icons) {
     if (!icons.count) return;
     NSDictionary *cache = @{@"IOSDump_CSI_Icons" : icons, @"Enabled" : @YES};
     [cache writeToFile:SHARED_CACHE_PATH atomically:YES];
-    NSLog(@"[CustomShareIcon] 共享缓存已写入 count=%lu", (unsigned long)icons.count);
 }
 
 static void loadPrefs() {
-    // 1. 优先共享缓存
     NSDictionary *cache = [NSDictionary dictionaryWithContentsOfFile:SHARED_CACHE_PATH];
     if ([cache isKindOfClass:[NSDictionary class]]) {
         id icons = cache[@"IOSDump_CSI_Icons"];
@@ -70,12 +66,11 @@ static void loadPrefs() {
             isEnabled = YES;
             if (!imageCache) imageCache = [NSMutableDictionary new];
             else [imageCache removeAllObjects];
-            NSLog(@"[CustomShareIcon] 共享缓存读取成功 count=%lu keys=%@", (unsigned long)customIconsDict.count, customIconsDict.allKeys);
+            NSLog(@"[CustomShareIcon] 共享缓存 count=%lu keys=%@", (unsigned long)customIconsDict.count, customIconsDict.allKeys);
             return;
         }
     }
 
-    // 2. 简单 CFPreferences 兜底
     CFPreferencesAppSynchronize(PREFS_DOMAIN);
     CFPropertyListRef iconsRef = CFPreferencesCopyAppValue(CFSTR("IOSDump_CSI_Icons"), PREFS_DOMAIN);
     if (!iconsRef) iconsRef = CFPreferencesCopyAppValue(CFSTR("IOSDump_CSI_Icons"), kCFPreferencesAnyApplication);
@@ -88,15 +83,11 @@ static void loadPrefs() {
     if (iconsRef) CFRelease(iconsRef);
 
     isEnabled = (customIconsDict.count > 0);
-
     if (!imageCache) imageCache = [NSMutableDictionary new];
     else [imageCache removeAllObjects];
 
-    NSLog(@"[CustomShareIcon] loadPrefs enabled=%d count=%lu keys=%@", isEnabled,
-          (unsigned long)(customIconsDict ? customIconsDict.count : 0),
-          customIconsDict.allKeys ?: @[]);
+    NSLog(@"[CustomShareIcon] loadPrefs enabled=%d count=%lu", isEnabled, (unsigned long)(customIconsDict ? customIconsDict.count : 0));
 
-    // SpringBoard 写共享缓存
     if (isSpringBoardProcess() && customIconsDict.count > 0) {
         writeSharedCache(customIconsDict);
     }
@@ -106,7 +97,6 @@ static void ensurePrefsLoaded() {
     if (!customIconsDict.count) loadPrefs();
 }
 
-// 加强版匹配（专门照顾 App Store 扩展 ID）
 static UIImage *getCustomIconForID(NSString *identifier) {
     ensurePrefsLoaded();
     if (!isEnabled || !identifier.length || !customIconsDict.count) return nil;
@@ -116,7 +106,6 @@ static UIImage *getCustomIconForID(NSString *identifier) {
     NSString *matchedKey = nil;
     NSString *lowerId = identifier.lowercaseString;
 
-    // 1. 精确 / 忽略大小写
     for (NSString *key in customIconsDict) {
         if ([identifier caseInsensitiveCompare:key] == NSOrderedSame) {
             base64Str = customIconsDict[key];
@@ -125,12 +114,12 @@ static UIImage *getCustomIconForID(NSString *identifier) {
         }
     }
 
-    // 2. 包含匹配（App Store 扩展最常见：com.xxx.yyy.share → com.xxx.yyy）
     if (!base64Str) {
         for (NSString *key in customIconsDict) {
             if (key.length == 0) continue;
             NSString *lowerKey = key.lowercaseString;
-            if ([lowerId containsString:lowerKey] || [lowerKey containsString:lowerId]) {
+            if ([lowerId containsString:lowerKey] || [lowerKey containsString:lowerId] ||
+                [lowerId hasPrefix:lowerKey] || [lowerKey hasPrefix:lowerId]) {
                 base64Str = customIconsDict[key];
                 matchedKey = key;
                 break;
@@ -138,19 +127,6 @@ static UIImage *getCustomIconForID(NSString *identifier) {
         }
     }
 
-    // 3. 前缀匹配（com.tencent.mqq.xxx → com.tencent.mqq）
-    if (!base64Str) {
-        for (NSString *key in customIconsDict) {
-            if (key.length == 0) continue;
-            if ([lowerId hasPrefix:key.lowercaseString] || [key.lowercaseString hasPrefix:lowerId]) {
-                base64Str = customIconsDict[key];
-                matchedKey = key;
-                break;
-            }
-        }
-    }
-
-    // 4. 最后一段
     if (!base64Str) {
         NSString *last = [[identifier componentsSeparatedByString:@"."] lastObject];
         if (last.length > 2) {
@@ -169,11 +145,10 @@ static UIImage *getCustomIconForID(NSString *identifier) {
 
     NSData *data = [[NSData alloc] initWithBase64EncodedString:base64Str options:0];
     if (!data) return nil;
-
     UIImage *img = [UIImage imageWithData:data scale:3.0];
     if (img) {
         imageCache[identifier] = img;
-        NSLog(@"[CustomShareIcon] ✅ 匹配 %@ → %@", identifier, matchedKey);
+        NSLog(@"[CustomShareIcon] ✅ %@ → %@", identifier, matchedKey);
     }
     return img;
 }
@@ -182,7 +157,6 @@ static NSString *extractIdentifier(id proxy) {
     if (!proxy) return nil;
     NSString *result = nil;
 
-    // iOS 16+
     @try {
         if ([proxy respondsToSelector:@selector(applicationBundleIdentifier)]) {
             result = [proxy valueForKey:@"applicationBundleIdentifier"];
@@ -194,7 +168,6 @@ static NSString *extractIdentifier(id proxy) {
     @try { activity = [proxy valueForKey:@"activity"]; } @catch (NSException *e) {}
 
     if (activity) {
-        // App Store 应用最关键：containingAppBundleIdentifier
         @try {
             if ([activity respondsToSelector:@selector(containingAppBundleIdentifier)]) {
                 result = [activity valueForKey:@"containingAppBundleIdentifier"];
@@ -206,7 +179,6 @@ static NSString *extractIdentifier(id proxy) {
             if ([activity respondsToSelector:@selector(applicationExtension)]) {
                 id ext = [activity valueForKey:@"applicationExtension"];
                 if (ext) {
-                    // 先试扩展自己的 identifier
                     result = [ext valueForKey:@"identifier"];
                     if (result.length) return result;
                     id bundle = [ext valueForKey:@"_bundle"];
@@ -241,6 +213,23 @@ static NSString *extractIdentifier(id proxy) {
     } @catch (NSException *e) {}
 
     return nil;
+}
+
+static BOOL isInShareSheetContext(UIView *view) {
+    UIResponder *r = view;
+    int depth = 0;
+    while (r && depth < 18) {
+        NSString *cls = NSStringFromClass([r class]);
+        if ([cls containsString:@"Preferences"] || [cls containsString:@"PSList"] ||
+            [cls containsString:@"CustomShareIconRoot"]) return NO;
+        if ([cls containsString:@"UIActivityViewController"] || [cls containsString:@"SHSheet"] ||
+            [cls containsString:@"ShareSheet"] || [cls containsString:@"UIActivityList"] ||
+            [cls containsString:@"ActivityContent"] || [cls containsString:@"UIShareGroup"] ||
+            [cls containsString:@"ActivityGroup"] || [cls containsString:@"_UIHostActivity"]) return YES;
+        r = [r nextResponder];
+        depth++;
+    }
+    return NO;
 }
 
 #pragma mark - 源头
@@ -308,7 +297,6 @@ static NSString *extractIdentifier(id proxy) {
 %hook UIApplicationExtensionActivity
 
 - (UIImage *)_activityImage {
-    // App Store 应用核心路径
     NSString *bid = nil;
     if ([self respondsToSelector:@selector(containingAppBundleIdentifier)]) {
         bid = [self containingAppBundleIdentifier];
@@ -322,7 +310,7 @@ static NSString *extractIdentifier(id proxy) {
 
 %end
 
-#pragma mark - 主面板兜底
+#pragma mark - 主面板
 
 %hook UIShareGroupActivityCell
 
@@ -361,9 +349,6 @@ static NSString *extractIdentifier(id proxy) {
     %orig;
     [self csi_applyCustomIcon];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        [self csi_applyCustomIcon];
-    });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [self csi_applyCustomIcon];
     });
 }
@@ -431,8 +416,83 @@ static NSString *extractIdentifier(id proxy) {
 
 %end
 
+#pragma mark - 「更多」列表（重点补强）
+
+%hook UITableViewCell
+
+- (void)layoutSubviews {
+    %orig;
+    ensurePrefsLoaded();
+    if (!isEnabled || !customIconsDict.count) return;
+    if (!isInShareSheetContext(self)) return;
+
+    // 找到图标 ImageView
+    UIImageView *targetIv = nil;
+    if (self.imageView && self.imageView.frame.size.width >= 24) {
+        targetIv = self.imageView;
+    }
+    if (!targetIv) {
+        for (UIView *sub in self.contentView.subviews) {
+            if ([sub isKindOfClass:[UIImageView class]]) {
+                UIImageView *iv = (UIImageView *)sub;
+                if (iv.frame.size.width >= 24 && iv.frame.size.width <= 80) {
+                    targetIv = iv;
+                    break;
+                }
+            }
+        }
+    }
+    if (!targetIv) return;
+
+    // 尝试用标题文字辅助匹配（更多列表经常只有名字）
+    NSString *title = self.textLabel.text;
+    UIImage *customImage = nil;
+
+    if (title.length) {
+        // 用标题去碰已配置的 key 的最后一段（粗糙但有时有效）
+        for (NSString *key in customIconsDict) {
+            NSString *last = [[key componentsSeparatedByString:@"."] lastObject];
+            if (last.length > 2 && [title.lowercaseString containsString:last.lowercaseString]) {
+                customImage = getCustomIconForID(key);
+                if (customImage) break;
+            }
+        }
+    }
+
+    // 如果源头已经把正确图片设进来了，这里也可以强制再盖一次
+    // 由于更多列表很难拿到 proxy，这里主要依赖源头；若有自定义图就盖
+    if (!customImage) return;
+
+    targetIv.image = customImage;
+    targetIv.contentMode = UIViewContentModeScaleAspectFit;
+    targetIv.clipsToBounds = YES;
+    targetIv.layer.cornerRadius = 8.0;
+
+    UIImageView *overlay = [self.contentView viewWithTag:TAG_CUSTOM_ICON];
+    if (!overlay) {
+        overlay = [UIImageView new];
+        overlay.tag = TAG_CUSTOM_ICON;
+        overlay.contentMode = UIViewContentModeScaleAspectFit;
+        overlay.clipsToBounds = YES;
+        [self.contentView addSubview:overlay];
+    }
+    overlay.frame = targetIv.frame;
+    overlay.layer.cornerRadius = 8.0;
+    overlay.image = customImage;
+    overlay.hidden = NO;
+    [self.contentView bringSubviewToFront:overlay];
+}
+
+- (void)prepareForReuse {
+    %orig;
+    UIImageView *iv = [self.contentView viewWithTag:TAG_CUSTOM_ICON];
+    if (iv) { iv.hidden = YES; iv.image = nil; }
+}
+
+%end
+
 %ctor {
-    NSLog(@"[CustomShareIcon] 简化版加载完成 (SB共享缓存 + AppStore加强匹配)");
+    NSLog(@"[CustomShareIcon] 加载完成 (更多列表补强 + SB缓存)");
     loadPrefs();
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
                                     NULL, (CFNotificationCallback)loadPrefs,
