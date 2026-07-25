@@ -26,7 +26,6 @@
     if ([obj isKindOfClass:[NSDictionary class]]) {
         self.iconsDict = [obj mutableCopy];
     } else {
-        // 兼容 NSUserDefaults
         NSDictionary *d = [[NSUserDefaults standardUserDefaults] persistentDomainForName:PREFS_ID];
         id icons = d[ICONS_KEY];
         if ([icons isKindOfClass:[NSDictionary class]]) {
@@ -43,16 +42,14 @@
     CFPreferencesSetAppValue(CFSTR("IOSDump_CSI_Icons"), (__bridge CFPropertyListRef)self.iconsDict, CFSTR("com.iosdump.customshareicon"));
     CFPreferencesAppSynchronize(CFSTR("com.iosdump.customshareicon"));
 
-    // 同步写 NSUserDefaults 域
     NSUserDefaults *ud = [[NSUserDefaults alloc] initWithSuiteName:PREFS_ID];
     if (!ud) ud = [NSUserDefaults standardUserDefaults];
     [ud setObject:self.iconsDict forKey:ICONS_KEY];
     [ud synchronize];
 
-    // 写共享缓存（让 SpringBoard / 分享进程立刻能读到）
     Boolean keyExists = false;
     Boolean en = CFPreferencesGetAppBooleanValue(CFSTR("Enabled"), CFSTR("com.iosdump.customshareicon"), &keyExists);
-    if (!keyExists) en = YES; // 默认开
+    if (!keyExists) en = YES;
 
     NSDictionary *cache = @{
         @"Enabled" : @(en),
@@ -94,7 +91,6 @@
     [ud setBool:on forKey:ENABLED_KEY];
     [ud synchronize];
 
-    // 立刻更新共享缓存
     NSDictionary *cache = @{
         @"Enabled" : @(on),
         @"IOSDump_CSI_Icons" : self.iconsDict ?: @{},
@@ -108,21 +104,18 @@
 #pragma mark - 动态列表
 
 - (void)rebuildIconSpecifiers {
-    // 删掉旧的图标相关 specifier（保留开关和按钮）
     NSMutableArray *keep = [NSMutableArray new];
     for (PSSpecifier *sp in _specifiers) {
         NSString *name = [sp propertyForKey:PSIDKey];
         if ([name isEqualToString:@"Enabled"] ||
             [name isEqualToString:@"AddButton"] ||
             [name isEqualToString:@"GroupMain"] ||
-            [name isEqualToString:@"GroupList"] ||
-            [name isEqualToString:@"FooterHelp"]) {
+            [name isEqualToString:@"GroupList"]) {
             [keep addObject:sp];
         }
     }
     _specifiers = keep;
 
-    // 插入已有图标条目
     NSInteger insertAt = _specifiers.count;
     for (PSSpecifier *sp in _specifiers) {
         if ([[sp propertyForKey:PSIDKey] isEqualToString:@"GroupList"]) {
@@ -143,7 +136,6 @@
         [sp setProperty:key forKey:PSIDKey];
         [sp setProperty:key forKey:@"iconKey"];
         sp.buttonAction = @selector(iconTapped:);
-        // 长按或点击删除在 iconTapped 里处理
         [_specifiers insertObject:sp atIndex:insertAt++];
     }
 }
@@ -165,10 +157,9 @@
     }]];
     [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
 
-    // iPad 适配
-    if (UI_USER_INTERFACE_IDIOM() == UIUserInterfaceIdiomPad) {
+    if ([UIDevice currentDevice].userInterfaceIdiom == UIUserInterfaceIdiomPad) {
         alert.popoverPresentationController.sourceView = self.view;
-        alert.popoverPresentationController.sourceRect = CGRectMake(self.view.bounds.size.width / 2, 100, 1, 1);
+        alert.popoverPresentationController.sourceRect = CGRectMake(self.view.bounds.size.width / 2.0, 100.0, 1.0, 1.0);
     }
     [self presentViewController:alert animated:YES completion:nil];
 }
@@ -211,7 +202,6 @@
     UIImage *img = info[UIImagePickerControllerEditedImage] ?: info[UIImagePickerControllerOriginalImage];
     if (!img || !self.pendingBundleID.length) return;
 
-    // 缩放到合适尺寸再转 base64
     CGFloat maxSide = 180.0;
     CGFloat scale = MIN(1.0, maxSide / MAX(img.size.width, img.size.height));
     CGSize newSize = CGSizeMake(img.size.width * scale, img.size.height * scale);
