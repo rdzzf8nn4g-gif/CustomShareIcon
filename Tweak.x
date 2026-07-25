@@ -6,7 +6,7 @@
 #define PREFS_PATH @"/var/mobile/Library/Preferences/com.iosdump.customshareicon.plist"
 
 @interface UIShareGroupActivityCell : UICollectionViewCell
-- (void)csi_applyCustomIcon;
+- (void)setActivityProxy:(id)proxy;
 @end
 
 @interface UIActivityContentViewController : UIViewController
@@ -15,53 +15,14 @@
 
 @interface _UIActivityUserDefaultsViewController : UIViewController
 @property (retain, nonatomic) UITableView *tableView;
+- (id)activityForRowAtIndexPath:(NSIndexPath *)indexPath;
 @end
 
 static BOOL isEnabled = YES;
 static NSDictionary *customIconsDict = nil;
+static NSCache *imageCache = nil; // 采用原生 NSCache (线程绝对安全，内存自动管理)
 
-// 缓存池 (现在只在主线程运行，连锁都不需要了，0死锁风险)
-static NSMutableDictionary *imageCache = nil;
-
-// 实时刷新收集器
-static NSHashTable *activeShareVCs = nil;
-static NSHashTable *activeMoreVCs = nil;
-
-#pragma mark - 安全反射工具 (绝对不抛异常)
-
-static id safePerform(id obj, NSString *selName) {
-    if (!obj || !selName) return nil;
-    SEL sel = NSSelectorFromString(selName);
-    if ([obj respondsToSelector:sel]) {
-        #pragma clang diagnostic push
-        #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-        return [obj performSelector:sel];
-        #pragma clang diagnostic pop
-    }
-    return nil;
-}
-
-static NSString *safeString(id obj, NSString *selName) {
-    id val = safePerform(obj, selName);
-    return [val isKindOfClass:[NSString class]] ? val : nil;
-}
-
-#pragma mark - 加载逻辑
-
-static void reloadActiveUIs() {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        for (UIActivityContentViewController *vc in activeShareVCs) {
-            if ([vc respondsToSelector:@selector(activityCollectionView)]) {
-                [[vc activityCollectionView] reloadData];
-            }
-        }
-        for (_UIActivityUserDefaultsViewController *vc in activeMoreVCs) {
-            if ([vc respondsToSelector:@selector(tableView)]) {
-                [[vc tableView] reloadData];
-            }
-        }
-    });
-}
+#pragma mark - 核心数据加载
 
 static void loadPrefs() {
     CFPreferencesAppSynchronize(PREFS_DOMAIN);
@@ -77,7 +38,6 @@ static void loadPrefs() {
     }
     if (ref) CFRelease(ref);
     
-    // 沙盒兜底读取
     if (!tempIcons || tempIcons.count == 0) {
         NSDictionary *fileDict = [NSDictionary dictionaryWithContentsOfFile:PREFS_PATH];
         if (fileDict) {
@@ -85,16 +45,23 @@ static void loadPrefs() {
             if (fileDict[@"IOSDump_CSI_Icons"]) tempIcons = fileDict[@"IOSDump_CSI_Icons"];
         }
     }
+    
     customIconsDict = tempIcons ?: @{};
 
-    // 重新初始化缓存池
-    imageCache = [NSMutableDictionary new];
-    
-    NSLog(@"[CustomShareIcon] 纯UI模式加载成功: enabled=%d, icons=%lu", isEnabled, (unsigned long)customIconsDict.count);
-    reloadActiveUIs();
+    // 清空缓存
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        imageCache = [[NSCache alloc] init];
+    });
+    [imageCache removeAllObjects];
+
+    // 发送原生应用内通知进行安全刷新
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[NSNotificationCenter defaultCenter] postNotificationName:@"CSIReloadDataNotification" object:nil];
+    });
 }
 
-#pragma mark - 标识符提取与缓存获取
+#pragma mark - 安全解析 BundleID (0 抛出异常风险)
 
 static NSString *cleanBundleID(NSString *bid) {
     if (!bid || bid.length == 0) return nil;
@@ -105,30 +72,45 @@ static NSString *cleanBundleID(NSString *bid) {
     return bid;
 }
 
+static NSString *safeStringValue(id obj, NSString *key) {
+    if (!obj || !key) return nil;
+    @try {
+        id val = [obj valueForKey:key];
+        if ([val isKindOfClass:[NSString class]]) return val;
+    } @catch(NSException *e) {}
+    return nil;
+}
+
 static NSString *extractIdentifier(id proxy) {
     if (!proxy) return nil;
+    
+    NSString *bid = safeStringValue(proxy, @"applicationBundleIdentifier");
+    if (bid) return cleanBundleID(bid);
 
-    NSString *bid = safeString(proxy, @"applicationBundleIdentifier");
-    if (bid.length) return cleanBundleID(bid);
+    id activity = nil;
+    @try { activity = [proxy valueForKey:@"activity"]; } @catch(NSException *e) {}
+    if (!activity) activity = proxy;
 
-    id activity = safePerform(proxy, @"activity") ?: proxy;
-
-    bid = safeString(activity, @"containingAppBundleIdentifier");
-    if (bid.length) return cleanBundleID(bid);
-
-    id ext = safePerform(activity, @"applicationExtension");
+    bid = safeStringValue(activity, @"containingAppBundleIdentifier");
+    if (bid) return cleanBundleID(bid);
+    
+    bid = safeStringValue(activity, @"activityType");
+    if (bid) return cleanBundleID(bid);
+    
+    id ext = nil;
+    @try { ext = [activity valueForKey:@"applicationExtension"]; } @catch(NSException *e) {}
     if (ext) {
-        bid = safeString(ext, @"identifier");
-        if (bid.length) return cleanBundleID(bid);
+        bid = safeStringValue(ext, @"identifier");
+        if (bid) return cleanBundleID(bid);
         
-        id bundle = safePerform(ext, @"_bundle");
-        bid = safeString(bundle, @"bundleIdentifier");
-        if (bid.length) return cleanBundleID(bid);
+        id bundle = nil;
+        @try { bundle = [ext valueForKey:@"_bundle"]; } @catch(NSException *e) {}
+        if (bundle) {
+            bid = safeStringValue(bundle, @"bundleIdentifier");
+            if (bid) return cleanBundleID(bid);
+        }
     }
-
-    bid = safeString(activity, @"activityType");
-    if (bid.length) return cleanBundleID(bid);
-
+    
     return nil;
 }
 
@@ -138,8 +120,8 @@ static UIImage *getCustomIconForID(NSString *identifier) {
     NSString *cleanID = cleanBundleID(identifier);
     if (!cleanID.length) return nil;
     
-    // 极速返回缓存 (含未命中的 NSNull)
-    id cachedObj = imageCache[cleanID];
+    // 1. 查询极速缓存
+    id cachedObj = [imageCache objectForKey:cleanID];
     if (cachedObj) {
         return cachedObj == [NSNull null] ? nil : (UIImage *)cachedObj;
     }
@@ -147,6 +129,7 @@ static UIImage *getCustomIconForID(NSString *identifier) {
     NSString *base64 = nil;
     NSString *lower = cleanID.lowercaseString;
 
+    // 2. 匹配字典
     for (NSString *key in customIconsDict) {
         if ([lower caseInsensitiveCompare:key] == NSOrderedSame) {
             base64 = customIconsDict[key]; break;
@@ -163,125 +146,128 @@ static UIImage *getCustomIconForID(NSString *identifier) {
         }
     }
     
+    // 3. 拦截不存在的 ID 并缓存 NSNull，斩断卡死
     if (!base64) {
-        imageCache[cleanID] = [NSNull null];
+        [imageCache setObject:[NSNull null] forKey:cleanID];
         return nil;
     }
 
     NSData *data = [[NSData alloc] initWithBase64EncodedString:base64 options:0];
     UIImage *img = data ? [UIImage imageWithData:data scale:3.0] : nil;
     
-    imageCache[cleanID] = img ?: [NSNull null];
+    [imageCache setObject:(img ?: [NSNull null]) forKey:cleanID];
     return img;
 }
 
-#pragma mark - 收集面板 VC 进行实时刷新
+#pragma mark - 自动刷新绑定
 
 %hook UIActivityContentViewController
 - (void)viewDidLoad {
     %orig;
-    if (!activeShareVCs) activeShareVCs = [NSHashTable weakObjectsHashTable];
-    [activeShareVCs addObject:self];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(csi_triggerReload) name:@"CSIReloadDataNotification" object:nil];
+}
+%new
+- (void)csi_triggerReload {
+    if ([self respondsToSelector:@selector(activityCollectionView)]) {
+        [[self activityCollectionView] reloadData];
+    }
 }
 %end
 
 %hook _UIActivityUserDefaultsViewController
 - (void)viewDidLoad {
     %orig;
-    if (!activeMoreVCs) activeMoreVCs = [NSHashTable weakObjectsHashTable];
-    [activeMoreVCs addObject:self];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(csi_triggerReload) name:@"CSIReloadDataNotification" object:nil];
+}
+%new
+- (void)csi_triggerReload {
+    if ([self respondsToSelector:@selector(tableView)]) {
+        [[self tableView] reloadData];
+    }
 }
 %end
 
-#pragma mark - 主面板 Cell (纯视觉遮盖，0死循环，直角正方形)
+#pragma mark - 主面板 Cell (0 卡死隔离架构)
 
 %hook UIShareGroupActivityCell
-
-// 在图像更新的必经之路上打补丁
-- (void)setActivityProxy:(id)proxy { %orig; [self csi_applyCustomIcon]; }
-- (void)setImage:(UIImage *)image { %orig; [self csi_applyCustomIcon]; }
-- (void)_updateImageView { %orig; [self csi_applyCustomIcon]; }
 
 - (void)prepareForReuse {
     %orig;
     UIImageView *ov = (UIImageView *)[self.contentView viewWithTag:TAG_CUSTOM_ICON];
-    if (ov && !ov.hidden) {
+    if (ov) {
         ov.hidden = YES;
         ov.image = nil;
     }
-    
-    UIView *nativeIv = safePerform(self, @"activityImageView");
+    UIView *nativeIv = nil;
+    @try { nativeIv = [self valueForKey:@"activityImageView"]; } @catch(NSException *e) {}
     if (nativeIv && nativeIv.alpha != 1.0) {
         nativeIv.alpha = 1.0;
     }
 }
 
-%new
-- (void)csi_applyCustomIcon {
-    // 强制回到主线程执行 UI 更新，绝对安全
-    if (![NSThread isMainThread]) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            [self csi_applyCustomIcon];
-        });
-        return;
-    }
-
-    UIImageView *ov = (UIImageView *)[self.contentView viewWithTag:TAG_CUSTOM_ICON];
+// 数据绑定阶段 (此时不触发排版)
+- (void)setActivityProxy:(id)proxy {
+    %orig;
     
-    UIView *nativeIv = safePerform(self, @"activityImageView");
-    UIView *slotView = safePerform(self, @"imageSlotView");
-    UIView *ref = (nativeIv && nativeIv.frame.size.width > 10) ? nativeIv : slotView;
+    UIImageView *ov = (UIImageView *)[self.contentView viewWithTag:TAG_CUSTOM_ICON];
+    UIView *nativeIv = nil;
+    @try { nativeIv = [self valueForKey:@"activityImageView"]; } @catch(NSException *e) {}
     
     if (!isEnabled) {
-        if (ov && !ov.hidden) { ov.hidden = YES; ov.image = nil; }
-        if (nativeIv && nativeIv.alpha != 1.0) { nativeIv.alpha = 1.0; }
+        if (ov) ov.hidden = YES;
+        if (nativeIv) nativeIv.alpha = 1.0;
         return;
     }
 
-    id proxy = safePerform(self, @"activityProxy");
     NSString *identifier = extractIdentifier(proxy);
     UIImage *img = identifier.length ? getCustomIconForID(identifier) : nil;
     
     if (!img) {
-        if (ov && !ov.hidden) { ov.hidden = YES; ov.image = nil; }
-        if (nativeIv && nativeIv.alpha != 1.0) { nativeIv.alpha = 1.0; }
+        if (ov) ov.hidden = YES;
+        if (nativeIv) nativeIv.alpha = 1.0;
         return;
     }
 
-    if (!ref || CGRectIsEmpty(ref.frame)) return;
-
-    // 隐藏系统图片 (使用 alpha=0 不触发死循环)
-    if (nativeIv && nativeIv.alpha != 0.0) {
-        nativeIv.alpha = 0.0; 
-    }
-
     if (!ov) {
-        ov = [[UIImageView alloc] initWithFrame:ref.frame];
+        ov = [[UIImageView alloc] init];
         ov.tag = TAG_CUSTOM_ICON;
         ov.contentMode = UIViewContentModeScaleAspectFit;
         ov.clipsToBounds = YES;
-        ov.userInteractionEnabled = NO;
         ov.layer.cornerRadius = 0; // 强制绝对正方形
+        // 利用 Z 轴高度置顶，绝不触发 layoutSubviews 的死循环！
+        ov.layer.zPosition = 999;
         [self.contentView addSubview:ov]; 
     }
     
-    if (!CGRectEqualToRect(ov.frame, ref.frame)) ov.frame = ref.frame;
-    if (ov.image != img) ov.image = img;
-    if (ov.hidden) ov.hidden = NO;
+    ov.image = img;
+    ov.hidden = NO;
+    if (nativeIv) nativeIv.alpha = 0.0;
+}
+
+// 布局同步阶段 (只做 Frame 同步)
+- (void)layoutSubviews {
+    %orig;
     
-    // 维持层级：我们叠加的图层在顶端，但要留给角标空间
-    if ([self.contentView.subviews lastObject] != ov) {
-        [self.contentView bringSubviewToFront:ov];
-    }
-    UIView *badge = safePerform(self, @"badgeSlotView");
-    if (badge && [self.contentView.subviews lastObject] != badge) {
-        [self.contentView bringSubviewToFront:badge];
+    UIImageView *ov = (UIImageView *)[self.contentView viewWithTag:TAG_CUSTOM_ICON];
+    if (ov && !ov.hidden) {
+        UIView *nativeIv = nil;
+        UIView *slotView = nil;
+        @try {
+            if ([self respondsToSelector:@selector(activityImageView)]) nativeIv = [self valueForKey:@"activityImageView"];
+            if ([self respondsToSelector:@selector(imageSlotView)]) slotView = [self valueForKey:@"imageSlotView"];
+        } @catch(NSException *e) {}
+        
+        UIView *ref = (nativeIv && nativeIv.frame.size.width > 10) ? nativeIv : slotView;
+        // 同步位置
+        if (ref && !CGRectIsEmpty(ref.frame)) {
+            ov.frame = ref.frame;
+        }
     }
 }
 
 %end
 
-#pragma mark - 更多面板 Cell (列表绝对正方形覆盖)
+#pragma mark - 更多面板 Cell (列表正方形图标)
 
 %hook _UIActivityUserDefaultsViewController
 
@@ -291,8 +277,8 @@ static UIImage *getCustomIconForID(NSString *identifier) {
     UIImageView *ov = (UIImageView *)[cell.contentView viewWithTag:TAG_CUSTOM_ICON];
 
     if (!isEnabled) {
-        if (ov && !ov.hidden) ov.hidden = YES;
-        if (cell.imageView.alpha != 1.0) cell.imageView.alpha = 1.0;
+        if (ov) ov.hidden = YES;
+        if (cell.imageView) cell.imageView.alpha = 1.0;
         return;
     }
 
@@ -309,34 +295,32 @@ static UIImage *getCustomIconForID(NSString *identifier) {
     UIImage *img = getCustomIconForID(bid);
     
     if (!img) {
-        if (ov && !ov.hidden) ov.hidden = YES;
-        if (cell.imageView.alpha != 1.0) cell.imageView.alpha = 1.0;
+        if (ov) ov.hidden = YES;
+        if (cell.imageView) cell.imageView.alpha = 1.0;
         return;
     }
-
-    UIImageView *sysIv = cell.imageView;
-    if (sysIv && sysIv.alpha != 0.0) sysIv.alpha = 0.0; 
 
     if (!ov) {
         ov = [UIImageView new];
         ov.tag = TAG_CUSTOM_ICON;
         ov.contentMode = UIViewContentModeScaleAspectFit;
         ov.clipsToBounds = YES;
-        ov.layer.cornerRadius = 0; // 列表页依然强制绝对正方形
+        ov.layer.cornerRadius = 0; // 绝对正方形
+        ov.layer.zPosition = 999;  // 利用 Z 轴置顶
         [cell.contentView addSubview:ov];
     }
     
-    CGRect targetFrame;
-    if (sysIv && !CGRectIsEmpty(sysIv.frame)) {
-        targetFrame = sysIv.frame;
+    cell.imageView.alpha = 0.0;
+    
+    if (cell.imageView && !CGRectIsEmpty(cell.imageView.frame)) {
+        ov.frame = cell.imageView.frame;
     } else {
         CGFloat size = 29.0;
-        targetFrame = CGRectMake(16, (cell.bounds.size.height - size) / 2.0, size, size);
+        ov.frame = CGRectMake(16, (cell.bounds.size.height - size) / 2.0, size, size);
     }
     
-    if (!CGRectEqualToRect(ov.frame, targetFrame)) ov.frame = targetFrame;
-    if (ov.image != img) ov.image = img;
-    if (ov.hidden) ov.hidden = NO;
+    ov.image = img;
+    ov.hidden = NO;
 }
 
 %end
