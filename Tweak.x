@@ -136,6 +136,23 @@ static UIImage *getCustomIconForID(NSString *identifier) {
         }
     }
 
+    // 额外：从路径里提取可能的 Bundle ID 段
+    if (!base64Str && [identifier containsString:@"/"]) {
+        NSArray *parts = [identifier componentsSeparatedByString:@"/"];
+        for (NSString *part in parts) {
+            if (part.length < 3) continue;
+            for (NSString *key in customIconsDict) {
+                if ([part.lowercaseString containsString:key.lowercaseString] ||
+                    [key.lowercaseString containsString:part.lowercaseString]) {
+                    base64Str = customIconsDict[key];
+                    matchedKey = key;
+                    break;
+                }
+            }
+            if (base64Str) break;
+        }
+    }
+
     if (!base64Str) return nil;
 
     NSData *data = [[NSData alloc] initWithBase64EncodedString:base64Str options:0];
@@ -144,7 +161,7 @@ static UIImage *getCustomIconForID(NSString *identifier) {
     UIImage *img = [UIImage imageWithData:data scale:3.0];
     if (img) {
         imageCache[identifier] = img;
-        NSLog(@"[CustomShareIcon] ✅ 源头匹配成功 %@ → %@", identifier, matchedKey);
+        NSLog(@"[CustomShareIcon] ✅ 匹配成功 %@ → %@", identifier, matchedKey);
     }
     return img;
 }
@@ -235,14 +252,14 @@ static BOOL isInShareSheetContext(UIView *view) {
     return NO;
 }
 
-#pragma mark - ========== 源头拦截（核心）==========
+#pragma mark - ========== 源头拦截 ==========
 
 %hook UIActivity
 
 + (id)_activityImageForApplicationBundleIdentifier:(NSString *)identifier {
     UIImage *custom = getCustomIconForID(identifier);
     if (custom) {
-        NSLog(@"[CustomShareIcon] 源头拦截 BundleID → %@", identifier);
+        NSLog(@"[CustomShareIcon] 源头 BundleID → %@", identifier);
         return custom;
     }
     return %orig;
@@ -254,19 +271,33 @@ static BOOL isInShareSheetContext(UIView *view) {
         NSString *imageName = [configuration valueForKey:@"imageName"];
 
         if (bundlePath.length) {
+            // 多种提取方式
             NSString *last = [[bundlePath lastPathComponent] stringByDeletingPathExtension];
             UIImage *custom = getCustomIconForID(last);
             if (custom) {
-                NSLog(@"[CustomShareIcon] 源头拦截 BundlePath → %@", last);
+                NSLog(@"[CustomShareIcon] 源头 BundlePath last → %@", last);
                 return custom;
             }
+
+            // 完整路径匹配
             for (NSString *key in customIconsDict) {
                 if ([bundlePath.lowercaseString containsString:key.lowercaseString]) {
                     custom = getCustomIconForID(key);
                     if (custom) {
-                        NSLog(@"[CustomShareIcon] 源头拦截 BundlePath包含 → %@", key);
+                        NSLog(@"[CustomShareIcon] 源头 BundlePath 包含 → %@", key);
                         return custom;
                     }
+                }
+            }
+
+            // 路径分段匹配
+            NSArray *parts = [bundlePath componentsSeparatedByString:@"/"];
+            for (NSString *part in parts) {
+                if (part.length < 3) continue;
+                custom = getCustomIconForID(part);
+                if (custom) {
+                    NSLog(@"[CustomShareIcon] 源头 BundlePath 分段 → %@", part);
+                    return custom;
                 }
             }
         }
@@ -280,10 +311,7 @@ static BOOL isInShareSheetContext(UIView *view) {
 }
 
 - (UIImage *)activityImage {
-    NSString *type = nil;
-    if ([self respondsToSelector:@selector(activityType)]) {
-        type = [self activityType];
-    }
+    NSString *type = [self respondsToSelector:@selector(activityType)] ? [self activityType] : nil;
     UIImage *custom = getCustomIconForID(type);
     if (custom) return custom;
 
@@ -296,10 +324,7 @@ static BOOL isInShareSheetContext(UIView *view) {
 }
 
 - (UIImage *)_activityImage {
-    NSString *type = nil;
-    if ([self respondsToSelector:@selector(activityType)]) {
-        type = [self activityType];
-    }
+    NSString *type = [self respondsToSelector:@selector(activityType)] ? [self activityType] : nil;
     UIImage *custom = getCustomIconForID(type);
     if (custom) return custom;
 
@@ -312,10 +337,7 @@ static BOOL isInShareSheetContext(UIView *view) {
 }
 
 - (NSString *)_systemImageName {
-    NSString *type = nil;
-    if ([self respondsToSelector:@selector(activityType)]) {
-        type = [self activityType];
-    }
+    NSString *type = [self respondsToSelector:@selector(activityType)] ? [self activityType] : nil;
     if (getCustomIconForID(type)) return nil;
     return %orig;
 }
@@ -334,7 +356,7 @@ static BOOL isInShareSheetContext(UIView *view) {
     }
     UIImage *custom = getCustomIconForID(bid);
     if (custom) {
-        NSLog(@"[CustomShareIcon] Extension源头拦截 → %@", bid);
+        NSLog(@"[CustomShareIcon] Extension源头 → %@", bid);
         return custom;
     }
     return %orig;
@@ -342,7 +364,7 @@ static BOOL isInShareSheetContext(UIView *view) {
 
 %end
 
-#pragma mark - 主面板（轻量兜底）
+#pragma mark - 主面板强制兜底（对抗 slot 回写）
 
 %hook UIShareGroupActivityCell
 
@@ -381,10 +403,13 @@ static BOOL isInShareSheetContext(UIView *view) {
     %orig;
     [self csi_applyCustomIcon];
     dispatch_async(dispatch_get_main_queue(), ^{ [self csi_applyCustomIcon]; });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.08 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [self csi_applyCustomIcon];
     });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.25 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [self csi_applyCustomIcon];
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [self csi_applyCustomIcon];
     });
 }
@@ -405,13 +430,16 @@ static BOOL isInShareSheetContext(UIView *view) {
 
 %new
 - (void)csi_forceApplyAfterDelay {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [self csi_applyCustomIcon];
     });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [self csi_applyCustomIcon];
     });
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.7 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [self csi_applyCustomIcon];
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [self csi_applyCustomIcon];
     });
 }
@@ -441,6 +469,7 @@ static BOOL isInShareSheetContext(UIView *view) {
     }
     if (!ref) return;
 
+    // 强制改原生
     if (nativeIv) {
         nativeIv.image = customImage;
         nativeIv.hidden = NO;
@@ -449,6 +478,7 @@ static BOOL isInShareSheetContext(UIView *view) {
         nativeIv.clipsToBounds = YES;
     }
 
+    // 强制 overlay
     UIImageView *customIv = [self.contentView viewWithTag:TAG_CUSTOM_ICON];
     if (!customIv) {
         customIv = [UIImageView new];
@@ -472,6 +502,12 @@ static BOOL isInShareSheetContext(UIView *view) {
     if (badgeView) {
         [self.contentView bringSubviewToFront:badgeView];
     }
+    for (UIView *sub in self.contentView.subviews) {
+        NSString *n = NSStringFromClass([sub class]).lowercaseString;
+        if ([n containsString:@"badge"] || [n containsString:@"dot"]) {
+            [self.contentView bringSubviewToFront:sub];
+        }
+    }
 }
 
 %end
@@ -483,6 +519,22 @@ static BOOL isInShareSheetContext(UIView *view) {
 - (void)layoutSubviews {
     %orig;
     if (!isEnabled || !isInShareSheetContext(self)) return;
+
+    UIImageView *targetIv = nil;
+    if (self.imageView && !CGRectIsEmpty(self.imageView.frame) && self.imageView.frame.size.width >= 28) {
+        targetIv = self.imageView;
+    } else {
+        for (UIView *sub in self.contentView.subviews) {
+            if ([sub isKindOfClass:[UIImageView class]] && sub.frame.size.width >= 28 && sub.frame.size.width <= 70) {
+                targetIv = (UIImageView *)sub;
+                break;
+            }
+        }
+    }
+    if (!targetIv) return;
+
+    // 尝试从 cell 文本匹配（更多列表有时只有标题）
+    // 这里只做轻量处理，主要依赖源头
 }
 
 - (void)prepareForReuse {
@@ -497,7 +549,7 @@ static BOOL isInShareSheetContext(UIView *view) {
 %end
 
 %ctor {
-    NSLog(@"[CustomShareIcon] Tweak 加载完成 (源头拦截 + 轻量兜底版)");
+    NSLog(@"[CustomShareIcon] Tweak 加载完成 (源头加强 + slot强制兜底版)");
     loadPrefs();
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
                                     NULL, (CFNotificationCallback)loadPrefs,
