@@ -3,10 +3,7 @@
 
 #define TAG_CUSTOM_ICON 998877
 #define PREFS_DOMAIN CFSTR("com.iosdump.customshareicon")
-#define SHARED_CACHE_PATH @"/var/mobile/Library/Preferences/com.iosdump.customshareicon.shared.plist"
-// 兼容有根和无根路径
-#define IOSDUMP_LIB_PATH @"/var/jb/Library/iosdump"
-#define IOSDUMP_LIB_PATH_FALLBACK @"/Library/iosdump"
+#define PREFS_PATH @"/var/mobile/Library/Preferences/com.iosdump.customshareicon.plist"
 
 @interface UIShareGroupActivityCell : UICollectionViewCell
 @property (nonatomic, strong) id activityProxy;
@@ -14,24 +11,6 @@
 - (void)setImage:(UIImage *)image;
 - (void)_updateImageView;
 - (void)csi_applyCustomIcon;
-@end
-
-@interface UIApplicationExtensionActivity : UIActivity
-@property (readonly, nonatomic) NSString *containingAppBundleIdentifier;
-@property (retain, nonatomic) id applicationExtension;
-- (NSString *)activityType;
-- (UIImage *)_activityImage;
-- (UIImage *)_actionImage;
-- (UIImage *)_activitySettingsImage;
-@end
-
-@interface UIActivity (CustomShareIcon)
-+ (id)_activityImageForApplicationBundleIdentifier:(NSString *)identifier;
-+ (id)_activityImageForBundleImageConfiguration:(id)configuration;
-- (UIImage *)activityImage;
-- (UIImage *)_activityImage;
-- (NSString *)_systemImageName;
-- (NSString *)activityType;
 @end
 
 @interface UIActivityContentViewController : UIViewController
@@ -43,23 +22,22 @@
 - (id)activityForRowAtIndexPath:(NSIndexPath *)indexPath;
 @end
 
-static BOOL isEnabled = NO;
-static BOOL isInitialLoad = YES;
+static BOOL isEnabled = YES;
 static NSDictionary *customIconsDict = nil;
-static NSMutableDictionary *imageCache = nil;
 
+// 缓存池与线程锁 (彻底防止卡死核心机制)
+static NSMutableDictionary *imageCache = nil;
+static NSLock *cacheLock = nil;
+
+// 实时刷新收集器
 static NSHashTable *activeShareVCs = nil;
 static NSHashTable *activeMoreVCs = nil;
+static BOOL isInitialLoad = YES;
 
 #pragma mark - 工具与加载逻辑
 
-static BOOL isSpringBoardProcess() {
-    return [[[NSBundle mainBundle] bundleIdentifier] isEqualToString:@"com.apple.springboard"] ||
-           [[[NSProcessInfo processInfo] processName] isEqualToString:@"SpringBoard"];
-}
-
 static void reloadActiveUIs() {
-    if (isInitialLoad) return; // 防止启动阶段死锁
+    if (isInitialLoad) return; 
     dispatch_async(dispatch_get_main_queue(), ^{
         for (UIActivityContentViewController *vc in activeShareVCs) {
             if ([vc respondsToSelector:@selector(activityCollectionView)]) {
@@ -74,73 +52,55 @@ static void reloadActiveUIs() {
     });
 }
 
-static void writeSharedCache(NSDictionary *icons, BOOL enabled) {
-    if (!icons) icons = @{};
-    [@{@"IOSDump_CSI_Icons": icons, @"Enabled": @(enabled)} writeToFile:SHARED_CACHE_PATH atomically:YES];
-}
-
 static void loadPrefs() {
-    BOOL enabledVal = YES;
-    NSMutableDictionary *loadedIcons = [NSMutableDictionary new];
-    BOOL isSB = isSpringBoardProcess();
-
-    if (isSB) {
-        // SB 进程：读取开关状态，并从 /Library/iosdump 文件夹读取物理图片转 Base64 放入内存
-        CFPreferencesAppSynchronize(PREFS_DOMAIN);
-        Boolean keyExists = false;
-        Boolean isEn = CFPreferencesGetAppBooleanValue(CFSTR("Enabled"), PREFS_DOMAIN, &keyExists);
-        if (keyExists) enabledVal = isEn;
-
-        NSString *path = [[NSFileManager defaultManager] fileExistsAtPath:IOSDUMP_LIB_PATH] ? IOSDUMP_LIB_PATH : IOSDUMP_LIB_PATH_FALLBACK;
-        NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:path error:nil];
-        for (NSString *file in files) {
-            if ([file hasSuffix:@".png"] || [file hasSuffix:@".jpg"]) {
-                NSString *bid = [[file lastPathComponent] stringByDeletingPathExtension];
-                NSData *data = [NSData dataWithContentsOfFile:[path stringByAppendingPathComponent:file]];
-                if (data) {
-                    loadedIcons[bid] = [data base64EncodedStringWithOptions:0];
-                }
-            }
-        }
-        // 同步给沙盒进程
-        writeSharedCache(loadedIcons, enabledVal);
-        customIconsDict = [loadedIcons copy];
-        isEnabled = enabledVal;
-    } else {
-        // 分享面板进程：直接从 SB 写好的共享缓存中读取数据，避开沙盒限制
-        NSDictionary *cache = [NSDictionary dictionaryWithContentsOfFile:SHARED_CACHE_PATH];
-        if (cache) {
-            if (cache[@"Enabled"]) enabledVal = [cache[@"Enabled"] boolValue];
-            id iconsVal = cache[@"IOSDump_CSI_Icons"];
-            if ([iconsVal isKindOfClass:[NSDictionary class]]) {
-                customIconsDict = [iconsVal copy];
-            }
-        }
-        isEnabled = enabledVal;
-    }
+    CFPreferencesAppSynchronize(PREFS_DOMAIN);
     
-    if (!customIconsDict) customIconsDict = @{};
+    // 1. 读取开关状态
+    Boolean keyExists = false;
+    Boolean isEn = CFPreferencesGetAppBooleanValue(CFSTR("Enabled"), PREFS_DOMAIN, &keyExists);
+    isEnabled = keyExists ? isEn : YES;
 
-    // 必须清空缓存池
-    if (!imageCache) imageCache = [NSMutableDictionary new];
+    // 2. 尝试从 CFPreferences 读取字典
+    NSDictionary *tempIcons = nil;
+    CFPropertyListRef ref = CFPreferencesCopyAppValue(CFSTR("IOSDump_CSI_Icons"), PREFS_DOMAIN);
+    if (ref && CFGetTypeID(ref) == CFDictionaryGetTypeID()) {
+        tempIcons = [(__bridge NSDictionary *)ref copy];
+    }
+    if (ref) CFRelease(ref);
+    
+    // 3. 沙盒进程兜底：如果 CFPreferences 读取不到，直接读物理文件
+    if (!tempIcons || tempIcons.count == 0) {
+        NSDictionary *fileDict = [NSDictionary dictionaryWithContentsOfFile:PREFS_PATH];
+        if (fileDict) {
+            if (fileDict[@"Enabled"]) isEnabled = [fileDict[@"Enabled"] boolValue];
+            if (fileDict[@"IOSDump_CSI_Icons"]) tempIcons = fileDict[@"IOSDump_CSI_Icons"];
+        }
+    }
+    customIconsDict = tempIcons ?: @{};
+
+    // 4. 重置缓存池，让设置里的更改立即生效
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        cacheLock = [NSLock new];
+        imageCache = [NSMutableDictionary new];
+    });
+    
+    [cacheLock lock];
     [imageCache removeAllObjects];
+    [cacheLock unlock];
 
-    NSLog(@"[CustomShareIcon] 偏好加载成功: enabled=%d, icons_count=%lu", isEnabled, (unsigned long)customIconsDict.count);
+    NSLog(@"[CustomShareIcon] 加载成功: enabled=%d, icons=%lu", isEnabled, (unsigned long)customIconsDict.count);
     reloadActiveUIs();
 }
 
-#pragma mark - 标识符提取与匹配 (彻底解决卡死)
+#pragma mark - 标识符提取与匹配 (0卡死优化)
 
 static NSString *cleanBundleID(NSString *bid) {
     if (!bid || bid.length == 0) return nil;
     NSString *lower = bid.lowercaseString;
-    if ([lower hasSuffix:@".shareextension"]) {
-        bid = [bid substringToIndex:bid.length - 15];
-    } else if ([lower hasSuffix:@".share"]) {
-        bid = [bid substringToIndex:bid.length - 6];
-    } else if ([lower hasSuffix:@".action"]) {
-        bid = [bid substringToIndex:bid.length - 7];
-    }
+    if ([lower hasSuffix:@".shareextension"]) return [bid substringToIndex:bid.length - 15];
+    if ([lower hasSuffix:@".share"]) return [bid substringToIndex:bid.length - 6];
+    if ([lower hasSuffix:@".action"]) return [bid substringToIndex:bid.length - 7];
     return bid;
 }
 
@@ -148,9 +108,13 @@ static UIImage *getCustomIconForID(NSString *identifier) {
     if (!isEnabled || !identifier.length || !customIconsDict.count) return nil;
     
     NSString *cleanID = cleanBundleID(identifier);
+    if (!cleanID.length) return nil;
     
-    // 【核心修复】：拦截已明确找不到结果的 BundleID，防止无限循环导致的卡死
+    // 【防卡死核心】：优先查询缓存，不管是图片还是未匹配标记 (NSNull)
+    [cacheLock lock];
     id cachedObj = imageCache[cleanID];
+    [cacheLock unlock];
+    
     if (cachedObj) {
         return cachedObj == [NSNull null] ? nil : (UIImage *)cachedObj;
     }
@@ -158,14 +122,14 @@ static UIImage *getCustomIconForID(NSString *identifier) {
     NSString *base64 = nil;
     NSString *lower = cleanID.lowercaseString;
 
-    // 1. 完全匹配
+    // 精确匹配
     for (NSString *key in customIconsDict) {
         if ([lower caseInsensitiveCompare:key] == NSOrderedSame) {
             base64 = customIconsDict[key]; break;
         }
     }
     
-    // 2. 包含匹配
+    // 模糊包含匹配
     if (!base64) {
         for (NSString *key in customIconsDict) {
             if (key.length < 3) continue;
@@ -176,24 +140,27 @@ static UIImage *getCustomIconForID(NSString *identifier) {
         }
     }
     
-    // 如果依然没找到，缓存 [NSNull null]，下次直接跳过
+    // 如果没有找到，将 NSNull 写入缓存，下次遇到直接跳过，杜绝死循环卡死！
     if (!base64) {
+        [cacheLock lock];
         imageCache[cleanID] = [NSNull null];
+        [cacheLock unlock];
         return nil;
     }
 
     NSData *data = [[NSData alloc] initWithBase64EncodedString:base64 options:0];
-    if (!data) {
-        imageCache[cleanID] = [NSNull null];
-        return nil;
-    }
+    if (!data) return nil;
     
     UIImage *img = [UIImage imageWithData:data scale:3.0];
+    
+    [cacheLock lock];
     if (img) {
         imageCache[cleanID] = img;
     } else {
         imageCache[cleanID] = [NSNull null];
     }
+    [cacheLock unlock];
+    
     return img;
 }
 
@@ -247,7 +214,7 @@ static NSString *extractIdentifier(id proxy) {
         if ([proxy respondsToSelector:@selector(activity)]) {
             activity = [proxy valueForKey:@"activity"];
         } else {
-            activity = proxy; 
+            activity = proxy;
         }
     } @catch (NSException *e) {}
 
@@ -264,7 +231,7 @@ static NSString *extractIdentifier(id proxy) {
     return nil;
 }
 
-#pragma mark - Hook 主面板 VC 与 更多列表 VC
+#pragma mark - 收集面板 VC 进行实时刷新
 
 %hook UIActivityContentViewController
 - (void)viewDidLoad {
@@ -279,42 +246,6 @@ static NSString *extractIdentifier(id proxy) {
     %orig;
     if (!activeMoreVCs) activeMoreVCs = [NSHashTable weakObjectsHashTable];
     [activeMoreVCs addObject:self];
-}
-%end
-
-#pragma mark - 源头：UIActivity
-
-%hook UIActivity
-+ (id)_activityImageForApplicationBundleIdentifier:(NSString *)identifier {
-    UIImage *c = getCustomIconForID(identifier);
-    return c ?: %orig;
-}
-- (UIImage *)activityImage {
-    UIImage *c = getCustomIconForID(bundleIDFromActivity(self));
-    return c ?: %orig;
-}
-- (UIImage *)_activityImage {
-    UIImage *c = getCustomIconForID(bundleIDFromActivity(self));
-    return c ?: %orig;
-}
-- (NSString *)_systemImageName {
-    if (getCustomIconForID(bundleIDFromActivity(self))) return nil;
-    return %orig;
-}
-%end
-
-%hook UIApplicationExtensionActivity
-- (UIImage *)_activityImage {
-    UIImage *c = getCustomIconForID(bundleIDFromActivity(self));
-    return c ?: %orig;
-}
-- (UIImage *)_actionImage {
-    UIImage *c = getCustomIconForID(bundleIDFromActivity(self));
-    return c ?: %orig;
-}
-- (UIImage *)_activitySettingsImage {
-    UIImage *c = getCustomIconForID(bundleIDFromActivity(self));
-    return c ?: %orig;
 }
 %end
 
@@ -362,8 +293,7 @@ static NSString *extractIdentifier(id proxy) {
     if (!ref || CGRectIsEmpty(ref.frame)) return;
 
     if (nativeIv) {
-        nativeIv.image = img;
-        nativeIv.layer.cornerRadius = 0; // 取消系统圆角
+        nativeIv.hidden = YES; // 彻底隐藏系统的图片，防止圆角干扰
     }
 
     if (!ov) {
@@ -376,7 +306,7 @@ static NSString *extractIdentifier(id proxy) {
     }
     
     ov.frame = ref.frame;
-    ov.layer.cornerRadius = 0; // 强制正方形
+    ov.layer.cornerRadius = 0; // 强制正方形！没有任何圆角！
     ov.image = img;
     ov.hidden = NO;
     [self.contentView bringSubviewToFront:ov];
@@ -389,13 +319,20 @@ static NSString *extractIdentifier(id proxy) {
 
 %end
 
-#pragma mark - 「更多」列表：_UIActivityUserDefaultsViewController
+#pragma mark - 更多面板 Cell (列表正方形图标)
 
 %hook _UIActivityUserDefaultsViewController
 
 - (void)tableView:(UITableView *)tableView willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)indexPath {
     %orig;
-    if (!isEnabled) return; 
+    
+    UIImageView *ov = [cell.contentView viewWithTag:TAG_CUSTOM_ICON];
+
+    if (!isEnabled) {
+        if (ov) ov.hidden = YES;
+        cell.imageView.hidden = NO;
+        return;
+    }
 
     id activity = nil;
     if ([self respondsToSelector:@selector(activityForRowAtIndexPath:)]) {
@@ -403,18 +340,44 @@ static NSString *extractIdentifier(id proxy) {
     }
     if (!activity) return;
 
-    NSString *bid = extractIdentifier(activity);
+    NSString *bid = bundleIDFromActivity(activity);
     UIImage *img = getCustomIconForID(bid);
-    if (img) {
-        cell.imageView.image = img;
-        cell.imageView.contentMode = UIViewContentModeScaleAspectFit;
-        cell.imageView.clipsToBounds = YES;
-        cell.imageView.layer.cornerRadius = 0; // 更多列表强制正方形
-        [cell setNeedsLayout];
+    
+    if (!img) {
+        if (ov) ov.hidden = YES;
+        cell.imageView.hidden = NO;
+        return;
     }
+
+    UIImageView *sysIv = cell.imageView;
+    sysIv.hidden = YES; // 必须隐藏原生 View，规避原生系统内置的图片属性束缚
+
+    if (!ov) {
+        ov = [UIImageView new];
+        ov.tag = TAG_CUSTOM_ICON;
+        ov.contentMode = UIViewContentModeScaleAspectFit;
+        ov.clipsToBounds = YES;
+        ov.layer.cornerRadius = 0; // 强制正方形！
+        [cell.contentView addSubview:ov];
+    }
+    
+    // 自动抓取系统 ImageView 的位置坐标
+    if (sysIv && !CGRectIsEmpty(sysIv.frame)) {
+        ov.frame = sysIv.frame;
+    } else {
+        // 兜底坐标尺寸
+        CGFloat size = 29.0;
+        ov.frame = CGRectMake(16, (cell.bounds.size.height - size) / 2.0, size, size);
+    }
+    
+    ov.image = img;
+    ov.hidden = NO;
+    [cell.contentView bringSubviewToFront:ov];
 }
 
 %end
+
+#pragma mark - 构造与监听
 
 %ctor {
     isInitialLoad = YES;
