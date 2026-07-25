@@ -15,7 +15,7 @@
 
 @interface UIApplicationExtensionActivity : UIActivity
 @property (readonly, nonatomic) NSString *containingAppBundleIdentifier;
-@property (retain, nonatomic) NSExtension *applicationExtension;
+@property (retain, nonatomic) id applicationExtension;
 - (NSString *)activityType;
 - (UIImage *)_activityImage;
 - (UIImage *)_actionImage;
