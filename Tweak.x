@@ -3,6 +3,7 @@
 
 #define TAG_CUSTOM_ICON 998877
 #define PREFS_DOMAIN CFSTR("com.iosdump.customshareicon")
+#define PREFS_ID @"com.iosdump.customshareicon"
 
 @interface _UIActivityBundleImageConfiguration : NSObject
 @property (nonatomic) long long activityCategory;
@@ -50,7 +51,40 @@ static BOOL isEnabled = NO;
 static NSDictionary *customIconsDict = nil;
 static NSMutableDictionary<NSString *, UIImage *> *imageCache = nil;
 
+#pragma mark - 最强双通道加载（CFPreferences + 直接读文件）
+
+static NSDictionary *loadIconsFromFile() {
+    // 常见偏好文件路径（有根 + 无根/隐根）
+    NSArray *paths = @[
+        [NSString stringWithFormat:@"/var/mobile/Library/Preferences/%@.plist", PREFS_ID],
+        [NSString stringWithFormat:@"/private/var/mobile/Library/Preferences/%@.plist", PREFS_ID],
+        [NSString stringWithFormat:@"/var/mobile/Library/Preferences/%@.plist", PREFS_ID],
+    ];
+
+    // 尝试从当前进程可见的 Library 路径
+    NSArray *libPaths = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES);
+    if (libPaths.count) {
+        NSString *p = [libPaths[0] stringByAppendingPathComponent:[NSString stringWithFormat:@"Preferences/%@.plist", PREFS_ID]];
+        paths = [paths arrayByAddingObject:p];
+    }
+
+    for (NSString *path in paths) {
+        if (![[NSFileManager defaultManager] fileExistsAtPath:path]) continue;
+        NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:path];
+        if (![dict isKindOfClass:[NSDictionary class]]) continue;
+
+        // 优先取 IOSDump_CSI_Icons
+        id icons = dict[@"IOSDump_CSI_Icons"];
+        if ([icons isKindOfClass:[NSDictionary class]] && [icons count] > 0) {
+            NSLog(@"[CustomShareIcon] 文件直读成功 path=%@ count=%lu", path, (unsigned long)[icons count]);
+            return [icons copy];
+        }
+    }
+    return nil;
+}
+
 static void loadPrefs() {
+    // ========== 通道1：CFPreferences 多路径 ==========
     CFPreferencesAppSynchronize(PREFS_DOMAIN);
     CFPreferencesAppSynchronize(kCFPreferencesAnyApplication);
     CFPreferencesAppSynchronize(CFSTR("com.iosdump.customshareicon"));
@@ -73,12 +107,23 @@ static void loadPrefs() {
     if (!iconsRef) iconsRef = CFPreferencesCopyValue(CFSTR("IOSDump_CSI_Icons"), kCFPreferencesAnyApplication, kCFPreferencesAnyUser, kCFPreferencesAnyHost);
     if (!iconsRef) iconsRef = CFPreferencesCopyValue(CFSTR("IOSDump_CSI_Icons"), CFSTR("com.iosdump.customshareicon"), kCFPreferencesAnyUser, kCFPreferencesAnyHost);
 
+    NSDictionary *cfDict = nil;
     if (iconsRef && CFGetTypeID(iconsRef) == CFDictionaryGetTypeID()) {
-        customIconsDict = [(__bridge NSDictionary *)iconsRef copy];
+        cfDict = [(__bridge NSDictionary *)iconsRef copy];
+    }
+    if (iconsRef) CFRelease(iconsRef);
+
+    // ========== 通道2：直接读文件（绕过部分重定向）==========
+    NSDictionary *fileDict = loadIconsFromFile();
+
+    // 优先用有数据的那一份
+    if (cfDict.count > 0) {
+        customIconsDict = cfDict;
+    } else if (fileDict.count > 0) {
+        customIconsDict = fileDict;
     } else {
         customIconsDict = nil;
     }
-    if (iconsRef) CFRelease(iconsRef);
 
     isEnabled = (customIconsDict.count > 0) ? YES : (keyExists ? enabledVal : NO);
 
@@ -90,16 +135,26 @@ static void loadPrefs() {
           customIconsDict.allKeys ?: @[]);
 }
 
+// 空字典时强制重载
+static void ensurePrefsLoaded() {
+    if (!customIconsDict || customIconsDict.count == 0) {
+        loadPrefs();
+    }
+}
+
 static UIImage *getCustomIconForID(NSString *identifier) {
+    ensurePrefsLoaded();
     if (!isEnabled || !identifier.length || !customIconsDict.count) return nil;
     if (imageCache[identifier]) return imageCache[identifier];
 
     NSString *base64Str = nil;
     NSString *matchedKey = nil;
 
+    // 1. 精确
     base64Str = customIconsDict[identifier];
     if (base64Str) matchedKey = identifier;
 
+    // 2. 忽略大小写
     if (!base64Str) {
         for (NSString *key in customIconsDict) {
             if ([identifier caseInsensitiveCompare:key] == NSOrderedSame) {
@@ -110,6 +165,7 @@ static UIImage *getCustomIconForID(NSString *identifier) {
         }
     }
 
+    // 3. 双向包含
     if (!base64Str) {
         for (NSString *key in customIconsDict) {
             if (key.length == 0) continue;
@@ -122,6 +178,7 @@ static UIImage *getCustomIconForID(NSString *identifier) {
         }
     }
 
+    // 4. 最后一段
     if (!base64Str) {
         NSString *last = [[identifier componentsSeparatedByString:@"."] lastObject];
         if (last.length > 2) {
@@ -136,7 +193,7 @@ static UIImage *getCustomIconForID(NSString *identifier) {
         }
     }
 
-    // 额外：从路径里提取可能的 Bundle ID 段
+    // 5. 路径分段
     if (!base64Str && [identifier containsString:@"/"]) {
         NSArray *parts = [identifier componentsSeparatedByString:@"/"];
         for (NSString *part in parts) {
@@ -271,7 +328,6 @@ static BOOL isInShareSheetContext(UIView *view) {
         NSString *imageName = [configuration valueForKey:@"imageName"];
 
         if (bundlePath.length) {
-            // 多种提取方式
             NSString *last = [[bundlePath lastPathComponent] stringByDeletingPathExtension];
             UIImage *custom = getCustomIconForID(last);
             if (custom) {
@@ -279,7 +335,6 @@ static BOOL isInShareSheetContext(UIView *view) {
                 return custom;
             }
 
-            // 完整路径匹配
             for (NSString *key in customIconsDict) {
                 if ([bundlePath.lowercaseString containsString:key.lowercaseString]) {
                     custom = getCustomIconForID(key);
@@ -290,7 +345,6 @@ static BOOL isInShareSheetContext(UIView *view) {
                 }
             }
 
-            // 路径分段匹配
             NSArray *parts = [bundlePath componentsSeparatedByString:@"/"];
             for (NSString *part in parts) {
                 if (part.length < 3) continue;
@@ -364,7 +418,7 @@ static BOOL isInShareSheetContext(UIView *view) {
 
 %end
 
-#pragma mark - 主面板强制兜底（对抗 slot 回写）
+#pragma mark - 主面板强制兜底
 
 %hook UIShareGroupActivityCell
 
@@ -446,6 +500,7 @@ static BOOL isInShareSheetContext(UIView *view) {
 
 %new
 - (void)csi_applyCustomIcon {
+    ensurePrefsLoaded();
     if (!isEnabled) return;
 
     id proxy = [self valueForKey:@"activityProxy"];
@@ -469,7 +524,6 @@ static BOOL isInShareSheetContext(UIView *view) {
     }
     if (!ref) return;
 
-    // 强制改原生
     if (nativeIv) {
         nativeIv.image = customImage;
         nativeIv.hidden = NO;
@@ -478,7 +532,6 @@ static BOOL isInShareSheetContext(UIView *view) {
         nativeIv.clipsToBounds = YES;
     }
 
-    // 强制 overlay
     UIImageView *customIv = [self.contentView viewWithTag:TAG_CUSTOM_ICON];
     if (!customIv) {
         customIv = [UIImageView new];
@@ -519,22 +572,6 @@ static BOOL isInShareSheetContext(UIView *view) {
 - (void)layoutSubviews {
     %orig;
     if (!isEnabled || !isInShareSheetContext(self)) return;
-
-    UIImageView *targetIv = nil;
-    if (self.imageView && !CGRectIsEmpty(self.imageView.frame) && self.imageView.frame.size.width >= 28) {
-        targetIv = self.imageView;
-    } else {
-        for (UIView *sub in self.contentView.subviews) {
-            if ([sub isKindOfClass:[UIImageView class]] && sub.frame.size.width >= 28 && sub.frame.size.width <= 70) {
-                targetIv = (UIImageView *)sub;
-                break;
-            }
-        }
-    }
-    if (!targetIv) return;
-
-    // 尝试从 cell 文本匹配（更多列表有时只有标题）
-    // 这里只做轻量处理，主要依赖源头
 }
 
 - (void)prepareForReuse {
@@ -549,7 +586,7 @@ static BOOL isInShareSheetContext(UIView *view) {
 %end
 
 %ctor {
-    NSLog(@"[CustomShareIcon] Tweak 加载完成 (源头加强 + slot强制兜底版)");
+    NSLog(@"[CustomShareIcon] Tweak 加载完成 (最强双通道 + 源头 + slot强制版)");
     loadPrefs();
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
                                     NULL, (CFNotificationCallback)loadPrefs,
