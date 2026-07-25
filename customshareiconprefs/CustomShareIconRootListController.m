@@ -5,7 +5,6 @@
 #define PREFS_ID @"com.iosdump.customshareicon"
 #define ICONS_KEY @"IOSDump_CSI_Icons"
 #define ENABLED_KEY @"Enabled"
-#define SHARED_CACHE_PATH @"/var/mobile/Library/Preferences/com.iosdump.customshareicon.shared.plist"
 
 @implementation CustomShareIconRootListController
 
@@ -47,17 +46,6 @@
     [ud setObject:self.iconsDict forKey:ICONS_KEY];
     [ud synchronize];
 
-    Boolean keyExists = false;
-    Boolean en = CFPreferencesGetAppBooleanValue(CFSTR("Enabled"), CFSTR("com.iosdump.customshareicon"), &keyExists);
-    if (!keyExists) en = YES;
-
-    NSDictionary *cache = @{
-        @"Enabled" : @(en),
-        @"IOSDump_CSI_Icons" : self.iconsDict ?: @{},
-        @"ts" : @([[NSDate date] timeIntervalSince1970])
-    };
-    [cache writeToFile:SHARED_CACHE_PATH atomically:YES];
-
     [self notifyReload];
 }
 
@@ -90,13 +78,6 @@
     if (!ud) ud = [NSUserDefaults standardUserDefaults];
     [ud setBool:on forKey:ENABLED_KEY];
     [ud synchronize];
-
-    NSDictionary *cache = @{
-        @"Enabled" : @(on),
-        @"IOSDump_CSI_Icons" : self.iconsDict ?: @{},
-        @"ts" : @([[NSDate date] timeIntervalSince1970])
-    };
-    [cache writeToFile:SHARED_CACHE_PATH atomically:YES];
 
     [self notifyReload];
 }
