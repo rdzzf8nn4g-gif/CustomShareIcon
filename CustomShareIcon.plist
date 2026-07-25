@@ -6,25 +6,9 @@
 	<dict>
 		<key>Bundles</key>
 		<array>
-			<string>com.apple.springboard</string>
-			<string>com.apple.UIKit</string>
+			
 			<string>com.apple.Sharing</string>
-			<string>com.apple.ShareSheet</string>
-			<string>com.apple.SharingUIService</string>
-			<string>com.apple.sharingd</string>
-			<string>com.apple.SocialLayer</string>
-			<string>com.apple.Preferences</string>
-			<string>com.apple.MobileSMS</string>
-			<string>com.apple.mobilesafari</string>
-			<string>com.apple.DocumentsApp</string>
-			<string>com.apple.Files</string>
-		</array>
-		<key>Executables</key>
-		<array>
-			<string>SharingUIService</string>
-			<string>sharingd</string>
-			<string>SpringBoard</string>
-			<string>Preferences</string>
+	
 		</array>
 	</dict>
 </dict>
