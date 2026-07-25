@@ -3,60 +3,53 @@
 #import <UIKit/UIKit.h>
 
 #define PREFS_ID @"com.iosdump.customshareicon"
-#define ICONS_KEY @"IOSDump_CSI_Icons"
 #define ENABLED_KEY @"Enabled"
 
+// 兼容有根无根路径
+#define IOSDUMP_LIB_PATH @"/var/jb/Library/iosdump"
+#define IOSDUMP_LIB_PATH_FALLBACK @"/Library/iosdump"
+
 @implementation CustomShareIconRootListController
+
+- (NSString *)currentLibPath {
+    return [[NSFileManager defaultManager] fileExistsAtPath:IOSDUMP_LIB_PATH] ? IOSDUMP_LIB_PATH : IOSDUMP_LIB_PATH_FALLBACK;
+}
+
+- (void)ensureDirectoryExists {
+    NSString *path = [self currentLibPath];
+    if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
+        [[NSFileManager defaultManager] createDirectoryAtPath:path withIntermediateDirectories:YES attributes:nil error:nil];
+    }
+}
 
 - (NSArray *)specifiers {
     if (!_specifiers) {
         _specifiers = [self loadSpecifiersFromPlistName:@"Root" target:self];
-        [self loadIconsFromPrefs];
+        [self loadIconsFromFiles];
         [self rebuildIconSpecifiers];
     }
     return _specifiers;
 }
 
-#pragma mark - 偏好读写
-
-- (void)loadIconsFromPrefs {
-    CFPreferencesAppSynchronize(CFSTR("com.iosdump.customshareicon"));
-    id obj = CFBridgingRelease(CFPreferencesCopyAppValue(CFSTR("IOSDump_CSI_Icons"), CFSTR("com.iosdump.customshareicon")));
-    if ([obj isKindOfClass:[NSDictionary class]]) {
-        self.iconsDict = [obj mutableCopy];
-    } else {
-        NSDictionary *d = [[NSUserDefaults standardUserDefaults] persistentDomainForName:PREFS_ID];
-        id icons = d[ICONS_KEY];
-        if ([icons isKindOfClass:[NSDictionary class]]) {
-            self.iconsDict = [icons mutableCopy];
-        } else {
-            self.iconsDict = [NSMutableDictionary new];
+- (void)loadIconsFromFiles {
+    if (!self.iconsDict) self.iconsDict = [NSMutableDictionary new];
+    [self.iconsDict removeAllObjects];
+    
+    NSString *path = [self currentLibPath];
+    NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:path error:nil];
+    for (NSString *file in files) {
+        if ([file hasSuffix:@".png"] || [file hasSuffix:@".jpg"]) {
+            NSString *bid = [file stringByDeletingPathExtension];
+            // 保存空字符代表此 ID 有图片即可，设置面板只关心列表存在
+            self.iconsDict[bid] = @"EXISTS"; 
         }
     }
 }
 
-- (void)saveIconsToPrefs {
-    if (!self.iconsDict) self.iconsDict = [NSMutableDictionary new];
-
-    CFPreferencesSetAppValue(CFSTR("IOSDump_CSI_Icons"), (__bridge CFPropertyListRef)self.iconsDict, CFSTR("com.iosdump.customshareicon"));
-    CFPreferencesAppSynchronize(CFSTR("com.iosdump.customshareicon"));
-
-    NSUserDefaults *ud = [[NSUserDefaults alloc] initWithSuiteName:PREFS_ID];
-    if (!ud) ud = [NSUserDefaults standardUserDefaults];
-    [ud setObject:self.iconsDict forKey:ICONS_KEY];
-    [ud synchronize];
-
-    [self notifyReload];
-}
-
 - (void)notifyReload {
-    CFNotificationCenterPostNotification(
-        CFNotificationCenterGetDarwinNotifyCenter(),
-        CFSTR("com.iosdump.customshareicon/ReloadPrefs"),
-        NULL,
-        NULL,
-        true
-    );
+    CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
+                                         CFSTR("com.iosdump.customshareicon/ReloadPrefs"),
+                                         NULL, NULL, true);
 }
 
 #pragma mark - 开关
@@ -73,12 +66,6 @@
     BOOL on = [value boolValue];
     CFPreferencesSetAppValue(CFSTR("Enabled"), on ? kCFBooleanTrue : kCFBooleanFalse, CFSTR("com.iosdump.customshareicon"));
     CFPreferencesAppSynchronize(CFSTR("com.iosdump.customshareicon"));
-
-    NSUserDefaults *ud = [[NSUserDefaults alloc] initWithSuiteName:PREFS_ID];
-    if (!ud) ud = [NSUserDefaults standardUserDefaults];
-    [ud setBool:on forKey:ENABLED_KEY];
-    [ud synchronize];
-
     [self notifyReload];
 }
 
@@ -125,19 +112,19 @@
     NSString *key = [specifier propertyForKey:@"iconKey"];
     if (!key.length) return;
 
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:key
-                                                                   message:@"选择操作"
-                                                            preferredStyle:UIAlertControllerStyleActionSheet];
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:key message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     [alert addAction:[UIAlertAction actionWithTitle:@"更换图片" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         [self pickImageForKey:key];
     }]];
     [alert addAction:[UIAlertAction actionWithTitle:@"删除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+        NSString *filePath = [NSString stringWithFormat:@"%@/%@.png", [self currentLibPath], key];
+        [[NSFileManager defaultManager] removeItemAtPath:filePath error:nil];
         [self.iconsDict removeObjectForKey:key];
-        [self saveIconsToPrefs];
+        [self notifyReload];
         [self reloadSpecifiers];
     }]];
     [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-
+    
     if ([UIDevice currentDevice].userInterfaceIdiom == UIUserInterfaceIdiomPad) {
         alert.popoverPresentationController.sourceView = self.view;
         alert.popoverPresentationController.sourceRect = CGRectMake(self.view.bounds.size.width / 2.0, 100.0, 1.0, 1.0);
@@ -147,7 +134,7 @@
 
 - (void)addNewIcon {
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"添加自定义图标"
-                                                                   message:@"输入 Bundle ID\n(如 com.tencent.xin)"
+                                                                   message:@"输入 App 的 Bundle ID\n(如 com.tencent.xin)"
                                                             preferredStyle:UIAlertControllerStyleAlert];
     [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
         tf.placeholder = @"com.example.app";
@@ -177,12 +164,13 @@
 
 #pragma mark - UIImagePickerController
 
-- (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey,id> *)info {
+- (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary *)info {
     [picker dismissViewControllerAnimated:YES completion:nil];
 
     UIImage *img = info[UIImagePickerControllerEditedImage] ?: info[UIImagePickerControllerOriginalImage];
     if (!img || !self.pendingBundleID.length) return;
 
+    // 缩放尺寸
     CGFloat maxSide = 180.0;
     CGFloat scale = MIN(1.0, maxSide / MAX(img.size.width, img.size.height));
     CGSize newSize = CGSizeMake(img.size.width * scale, img.size.height * scale);
@@ -192,17 +180,17 @@
     UIGraphicsEndImageContext();
 
     NSData *png = UIImagePNGRepresentation(resized);
-    if (!png) png = UIImageJPEGRepresentation(resized, 0.92);
-    if (!png) return;
-
-    NSString *b64 = [png base64EncodedStringWithOptions:0];
-    if (!b64.length) return;
-
-    if (!self.iconsDict) self.iconsDict = [NSMutableDictionary new];
-    self.iconsDict[self.pendingBundleID] = b64;
+    if (png) {
+        [self ensureDirectoryExists];
+        NSString *filePath = [NSString stringWithFormat:@"%@/%@.png", [self currentLibPath], self.pendingBundleID];
+        // 将图片文件直接保存至 /Library/iosdump/ (或无根的对应路径)
+        [png writeToFile:filePath atomically:YES];
+        
+        self.iconsDict[self.pendingBundleID] = @"EXISTS";
+    }
+    
     self.pendingBundleID = nil;
-
-    [self saveIconsToPrefs];
+    [self notifyReload];
     [self reloadSpecifiers];
 }
 
@@ -218,7 +206,7 @@
 
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
-    [self loadIconsFromPrefs];
+    [self loadIconsFromFiles];
 }
 
 @end
