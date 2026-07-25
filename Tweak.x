@@ -40,29 +40,16 @@
 static BOOL isEnabled = NO;
 static NSDictionary *customIconsDict = nil;
 static NSMutableDictionary *imageCache = nil;
+static BOOL prefsLoaded = NO;
 
-static BOOL isForbiddenDaemon(void) {
-    NSString *name = [[NSProcessInfo processInfo] processName] ?: @"";
-    static NSSet *bad = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        bad = [NSSet setWithArray:@[
-            @"sharingd", @"rapportd", @"bluetoothd", @"wifid",
-            @"useractivityd", @"dasd", @"powerd", @"runningboardd",
-            @"cfprefsd", @"configd", @"locationd", @"mediaserverd"
-        ]];
-    });
-    return [bad containsObject:name];
-}
-
+// 只读 CFPreferences，不碰任何文件路径（daemon 安全）
 static void loadPrefs(void) {
-    if (isForbiddenDaemon()) return;
-
     if (imageCache) [imageCache removeAllObjects];
     else imageCache = [NSMutableDictionary new];
 
     isEnabled = NO;
     customIconsDict = nil;
+    prefsLoaded = YES;
 
     @try {
         CFPreferencesAppSynchronize(PREFS_DOMAIN);
@@ -72,6 +59,9 @@ static void loadPrefs(void) {
     Boolean enVal = true;
     @try {
         enVal = CFPreferencesGetAppBooleanValue(CFSTR("Enabled"), PREFS_DOMAIN, &keyExists);
+        if (!keyExists) {
+            enVal = CFPreferencesGetAppBooleanValue(CFSTR("Enabled"), kCFPreferencesAnyApplication, &keyExists);
+        }
     } @catch (NSException *e) {}
 
     if (keyExists && !enVal) {
@@ -96,10 +86,11 @@ static void loadPrefs(void) {
     if (icons.count > 0) {
         customIconsDict = icons;
         isEnabled = YES;
-    } else {
-        isEnabled = NO;
-        customIconsDict = nil;
     }
+}
+
+static void ensurePrefs(void) {
+    if (!prefsLoaded) loadPrefs();
 }
 
 static UIImage *roundedImage(UIImage *img, CGFloat ratio) {
@@ -116,6 +107,7 @@ static UIImage *roundedImage(UIImage *img, CGFloat ratio) {
 }
 
 static UIImage *getCustomIconForID(NSString *identifier) {
+    ensurePrefs();
     if (!isEnabled || !identifier.length || !customIconsDict.count) return nil;
     if (imageCache[identifier]) return imageCache[identifier];
 
@@ -407,20 +399,27 @@ static void applyToImageView(UIImageView *iv, UIImage *img) {
 
 %end
 
-%ctor {
-    // 绝对禁止进入 daemon，避免 SANDBOX kill
-    if (isForbiddenDaemon()) return;
-
-    @try {
+static void prefsChanged(CFNotificationCenterRef center, void *observer, CFStringRef name, const void *object, CFDictionaryRef userInfo) {
+    prefsLoaded = NO;
+    // 延迟到主线程，避免在 notify 回调里碰偏好导致问题
+    dispatch_async(dispatch_get_main_queue(), ^{
         loadPrefs();
-    } @catch (NSException *e) {}
+    });
+}
 
+%ctor {
+    // 关键：不要在 dyld 加载阶段立刻读偏好（sharingd 会 SANDBOX kill）
+    // 只注册通知；真正读偏好放到主队列 / 第一次用图标时
     CFNotificationCenterAddObserver(
         CFNotificationCenterGetDarwinNotifyCenter(),
         NULL,
-        (CFNotificationCallback)loadPrefs,
+        prefsChanged,
         CFSTR("com.iosdump.customshareicon/ReloadPrefs"),
         NULL,
         CFNotificationSuspensionBehaviorCoalesce
     );
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        loadPrefs();
+    });
 }
