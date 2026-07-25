@@ -4,6 +4,7 @@
 #define TAG_CUSTOM_ICON 998877
 #define PREFS_DOMAIN CFSTR("com.iosdump.customshareicon")
 #define PREFS_ID @"com.iosdump.customshareicon"
+#define SHARED_CACHE_PATH @"/var/mobile/Library/Preferences/com.iosdump.customshareicon.shared.plist"
 
 @interface _UIActivityBundleImageConfiguration : NSObject
 @property (nonatomic) long long activityCategory;
@@ -51,32 +52,55 @@ static BOOL isEnabled = NO;
 static NSDictionary *customIconsDict = nil;
 static NSMutableDictionary<NSString *, UIImage *> *imageCache = nil;
 
-#pragma mark - 最强双通道加载（CFPreferences + 直接读文件）
+#pragma mark - 工具
 
-static NSDictionary *loadIconsFromFile() {
-    // 常见偏好文件路径（有根 + 无根/隐根）
+static BOOL isSpringBoardProcess() {
+    NSString *bid = [NSBundle mainBundle].bundleIdentifier;
+    if ([bid isEqualToString:@"com.apple.springboard"]) return YES;
+    NSString *proc = [[NSProcessInfo processInfo] processName];
+    if ([proc isEqualToString:@"SpringBoard"]) return YES;
+    return NO;
+}
+
+static void writeSharedCache(NSDictionary *icons, BOOL enabled) {
+    if (!icons.count) return;
+    NSDictionary *cache = @{
+        @"IOSDump_CSI_Icons" : icons,
+        @"Enabled" : @(enabled)
+    };
+    BOOL ok = [cache writeToFile:SHARED_CACHE_PATH atomically:YES];
+    NSLog(@"[CustomShareIcon] 共享缓存写入 %@ → %@", SHARED_CACHE_PATH, ok ? @"成功" : @"失败");
+}
+
+static NSDictionary *loadFromSharedCache() {
+    if (![[NSFileManager defaultManager] fileExistsAtPath:SHARED_CACHE_PATH]) return nil;
+    NSDictionary *cache = [NSDictionary dictionaryWithContentsOfFile:SHARED_CACHE_PATH];
+    if (![cache isKindOfClass:[NSDictionary class]]) return nil;
+    id icons = cache[@"IOSDump_CSI_Icons"];
+    if ([icons isKindOfClass:[NSDictionary class]] && [icons count] > 0) {
+        NSLog(@"[CustomShareIcon] 共享缓存读取成功 count=%lu", (unsigned long)[icons count]);
+        return [icons copy];
+    }
+    return nil;
+}
+
+static NSDictionary *loadIconsFromOriginalFile() {
     NSArray *paths = @[
         [NSString stringWithFormat:@"/var/mobile/Library/Preferences/%@.plist", PREFS_ID],
         [NSString stringWithFormat:@"/private/var/mobile/Library/Preferences/%@.plist", PREFS_ID],
-        [NSString stringWithFormat:@"/var/mobile/Library/Preferences/%@.plist", PREFS_ID],
     ];
-
-    // 尝试从当前进程可见的 Library 路径
     NSArray *libPaths = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES);
     if (libPaths.count) {
         NSString *p = [libPaths[0] stringByAppendingPathComponent:[NSString stringWithFormat:@"Preferences/%@.plist", PREFS_ID]];
         paths = [paths arrayByAddingObject:p];
     }
-
     for (NSString *path in paths) {
         if (![[NSFileManager defaultManager] fileExistsAtPath:path]) continue;
         NSDictionary *dict = [NSDictionary dictionaryWithContentsOfFile:path];
         if (![dict isKindOfClass:[NSDictionary class]]) continue;
-
-        // 优先取 IOSDump_CSI_Icons
         id icons = dict[@"IOSDump_CSI_Icons"];
         if ([icons isKindOfClass:[NSDictionary class]] && [icons count] > 0) {
-            NSLog(@"[CustomShareIcon] 文件直读成功 path=%@ count=%lu", path, (unsigned long)[icons count]);
+            NSLog(@"[CustomShareIcon] 原偏好文件读取成功 path=%@", path);
             return [icons copy];
         }
     }
@@ -84,7 +108,18 @@ static NSDictionary *loadIconsFromFile() {
 }
 
 static void loadPrefs() {
-    // ========== 通道1：CFPreferences 多路径 ==========
+    // ========== 1. 优先读共享缓存（所有进程）==========
+    NSDictionary *shared = loadFromSharedCache();
+    if (shared.count > 0) {
+        customIconsDict = shared;
+        isEnabled = YES;
+        if (!imageCache) imageCache = [NSMutableDictionary new];
+        else [imageCache removeAllObjects];
+        NSLog(@"[CustomShareIcon] loadPrefs(共享缓存) enabled=1 count=%lu keys=%@", (unsigned long)customIconsDict.count, customIconsDict.allKeys);
+        return;
+    }
+
+    // ========== 2. CFPreferences 多路径 ==========
     CFPreferencesAppSynchronize(PREFS_DOMAIN);
     CFPreferencesAppSynchronize(kCFPreferencesAnyApplication);
     CFPreferencesAppSynchronize(CFSTR("com.iosdump.customshareicon"));
@@ -96,16 +131,12 @@ static void loadPrefs() {
     if (!keyExists) {
         enabledVal = CFPreferencesGetAppBooleanValue(CFSTR("Enabled"), kCFPreferencesAnyApplication, &keyExists);
     }
-    if (!keyExists) {
-        enabledVal = CFPreferencesGetAppBooleanValue(CFSTR("Enabled"), CFSTR("com.iosdump.customshareicon"), &keyExists);
-    }
 
     CFPropertyListRef iconsRef = CFPreferencesCopyAppValue(CFSTR("IOSDump_CSI_Icons"), PREFS_DOMAIN);
     if (!iconsRef) iconsRef = CFPreferencesCopyAppValue(CFSTR("IOSDump_CSI_Icons"), kCFPreferencesAnyApplication);
     if (!iconsRef) iconsRef = CFPreferencesCopyAppValue(CFSTR("IOSDump_CSI_Icons"), CFSTR("com.iosdump.customshareicon"));
     if (!iconsRef) iconsRef = CFPreferencesCopyValue(CFSTR("IOSDump_CSI_Icons"), PREFS_DOMAIN, kCFPreferencesAnyUser, kCFPreferencesAnyHost);
     if (!iconsRef) iconsRef = CFPreferencesCopyValue(CFSTR("IOSDump_CSI_Icons"), kCFPreferencesAnyApplication, kCFPreferencesAnyUser, kCFPreferencesAnyHost);
-    if (!iconsRef) iconsRef = CFPreferencesCopyValue(CFSTR("IOSDump_CSI_Icons"), CFSTR("com.iosdump.customshareicon"), kCFPreferencesAnyUser, kCFPreferencesAnyHost);
 
     NSDictionary *cfDict = nil;
     if (iconsRef && CFGetTypeID(iconsRef) == CFDictionaryGetTypeID()) {
@@ -113,10 +144,9 @@ static void loadPrefs() {
     }
     if (iconsRef) CFRelease(iconsRef);
 
-    // ========== 通道2：直接读文件（绕过部分重定向）==========
-    NSDictionary *fileDict = loadIconsFromFile();
+    // ========== 3. 直接读原偏好文件 ==========
+    NSDictionary *fileDict = loadIconsFromOriginalFile();
 
-    // 优先用有数据的那一份
     if (cfDict.count > 0) {
         customIconsDict = cfDict;
     } else if (fileDict.count > 0) {
@@ -133,9 +163,13 @@ static void loadPrefs() {
     NSLog(@"[CustomShareIcon] loadPrefs enabled=%d count=%lu keys=%@", isEnabled,
           (unsigned long)(customIconsDict ? customIconsDict.count : 0),
           customIconsDict.allKeys ?: @[]);
+
+    // ========== 4. SpringBoard 负责写共享缓存 ==========
+    if (isSpringBoardProcess() && customIconsDict.count > 0) {
+        writeSharedCache(customIconsDict, isEnabled);
+    }
 }
 
-// 空字典时强制重载
 static void ensurePrefsLoaded() {
     if (!customIconsDict || customIconsDict.count == 0) {
         loadPrefs();
@@ -150,11 +184,9 @@ static UIImage *getCustomIconForID(NSString *identifier) {
     NSString *base64Str = nil;
     NSString *matchedKey = nil;
 
-    // 1. 精确
     base64Str = customIconsDict[identifier];
     if (base64Str) matchedKey = identifier;
 
-    // 2. 忽略大小写
     if (!base64Str) {
         for (NSString *key in customIconsDict) {
             if ([identifier caseInsensitiveCompare:key] == NSOrderedSame) {
@@ -165,7 +197,6 @@ static UIImage *getCustomIconForID(NSString *identifier) {
         }
     }
 
-    // 3. 双向包含
     if (!base64Str) {
         for (NSString *key in customIconsDict) {
             if (key.length == 0) continue;
@@ -178,7 +209,6 @@ static UIImage *getCustomIconForID(NSString *identifier) {
         }
     }
 
-    // 4. 最后一段
     if (!base64Str) {
         NSString *last = [[identifier componentsSeparatedByString:@"."] lastObject];
         if (last.length > 2) {
@@ -193,7 +223,6 @@ static UIImage *getCustomIconForID(NSString *identifier) {
         }
     }
 
-    // 5. 路径分段
     if (!base64Str && [identifier containsString:@"/"]) {
         NSArray *parts = [identifier componentsSeparatedByString:@"/"];
         for (NSString *part in parts) {
@@ -334,7 +363,6 @@ static BOOL isInShareSheetContext(UIView *view) {
                 NSLog(@"[CustomShareIcon] 源头 BundlePath last → %@", last);
                 return custom;
             }
-
             for (NSString *key in customIconsDict) {
                 if ([bundlePath.lowercaseString containsString:key.lowercaseString]) {
                     custom = getCustomIconForID(key);
@@ -344,7 +372,6 @@ static BOOL isInShareSheetContext(UIView *view) {
                     }
                 }
             }
-
             NSArray *parts = [bundlePath componentsSeparatedByString:@"/"];
             for (NSString *part in parts) {
                 if (part.length < 3) continue;
@@ -355,7 +382,6 @@ static BOOL isInShareSheetContext(UIView *view) {
                 }
             }
         }
-
         if (imageName.length) {
             UIImage *custom = getCustomIconForID(imageName);
             if (custom) return custom;
@@ -368,7 +394,6 @@ static BOOL isInShareSheetContext(UIView *view) {
     NSString *type = [self respondsToSelector:@selector(activityType)] ? [self activityType] : nil;
     UIImage *custom = getCustomIconForID(type);
     if (custom) return custom;
-
     if ([self respondsToSelector:@selector(containingAppBundleIdentifier)]) {
         NSString *bid = [self valueForKey:@"containingAppBundleIdentifier"];
         custom = getCustomIconForID(bid);
@@ -381,7 +406,6 @@ static BOOL isInShareSheetContext(UIView *view) {
     NSString *type = [self respondsToSelector:@selector(activityType)] ? [self activityType] : nil;
     UIImage *custom = getCustomIconForID(type);
     if (custom) return custom;
-
     if ([self respondsToSelector:@selector(containingAppBundleIdentifier)]) {
         NSString *bid = [self valueForKey:@"containingAppBundleIdentifier"];
         custom = getCustomIconForID(bid);
@@ -586,7 +610,7 @@ static BOOL isInShareSheetContext(UIView *view) {
 %end
 
 %ctor {
-    NSLog(@"[CustomShareIcon] Tweak 加载完成 (最强双通道 + 源头 + slot强制版)");
+    NSLog(@"[CustomShareIcon] Tweak 加载完成 (SB共享缓存 + 源头 + slot强制版)");
     loadPrefs();
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
                                     NULL, (CFNotificationCallback)loadPrefs,
