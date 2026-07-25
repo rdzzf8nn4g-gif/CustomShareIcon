@@ -8,6 +8,5 @@
 - (void)saveIconsToPrefs;
 - (void)notifyReload;
 - (void)addNewIcon;
-- (void)removeIcon:(PSSpecifier *)specifier;
 - (void)pickImageForKey:(NSString *)key;
 @end
