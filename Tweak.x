@@ -1,10 +1,8 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
-#import <unistd.h>
 
 #define TAG_CUSTOM_ICON 998877
 #define PREFS_DOMAIN CFSTR("com.iosdump.customshareicon")
-#define SHARED_CACHE_PATH "/var/mobile/Library/Preferences/com.iosdump.customshareicon.shared.plist"
 
 @interface UIShareGroupActivityCell : UICollectionViewCell
 @property (nonatomic, strong) id activityProxy;
@@ -43,111 +41,64 @@ static BOOL isEnabled = NO;
 static NSDictionary *customIconsDict = nil;
 static NSMutableDictionary *imageCache = nil;
 
-static BOOL isSpringBoardProcess(void) {
-    NSString *bid = [NSBundle mainBundle].bundleIdentifier;
-    if ([bid isEqualToString:@"com.apple.springboard"]) return YES;
-    if ([[[NSProcessInfo processInfo] processName] isEqualToString:@"SpringBoard"]) return YES;
-    return NO;
-}
-
-// 沙盒进程禁止碰共享缓存文件
-static BOOL canTouchSharedCacheFile(void) {
-    if (isSpringBoardProcess()) return YES;
-    NSString *bid = [NSBundle mainBundle].bundleIdentifier ?: @"";
-    // Preferences 设置页可以写
-    if ([bid isEqualToString:@"com.apple.Preferences"]) return YES;
-    // 普通 App（/var/mobile）可读；daemon 一律不碰文件
-    NSString *home = NSHomeDirectory() ?: @"";
-    if ([home hasPrefix:@"/var/mobile"]) return YES;
-    return NO;
-}
-
-static void writeSharedCache(NSDictionary *icons, BOOL enabled) {
-    if (!canTouchSharedCacheFile()) return;
-    if (!isSpringBoardProcess() && ![[NSBundle mainBundle].bundleIdentifier isEqualToString:@"com.apple.Preferences"]) return;
-
-    @try {
-        NSDictionary *obj = @{
-            @"Enabled" : @(enabled),
-            @"IOSDump_CSI_Icons" : (icons ?: @{}),
-            @"ts" : @([[NSDate date] timeIntervalSince1970])
-        };
-        [obj writeToFile:@(SHARED_CACHE_PATH) atomically:YES];
-    } @catch (NSException *e) {}
-}
-
-static NSDictionary *safeReadSharedCache(void) {
-    if (!canTouchSharedCacheFile()) return nil;
-    if (access(SHARED_CACHE_PATH, R_OK) != 0) return nil;
-    @try {
-        NSDictionary *cache = [NSDictionary dictionaryWithContentsOfFile:@(SHARED_CACHE_PATH)];
-        if ([cache isKindOfClass:[NSDictionary class]]) return cache;
-    } @catch (NSException *e) {}
-    return nil;
+static BOOL isForbiddenDaemon(void) {
+    NSString *name = [[NSProcessInfo processInfo] processName] ?: @"";
+    static NSSet *bad = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        bad = [NSSet setWithArray:@[
+            @"sharingd", @"rapportd", @"bluetoothd", @"wifid",
+            @"useractivityd", @"dasd", @"powerd", @"runningboardd",
+            @"cfprefsd", @"configd", @"locationd", @"mediaserverd"
+        ]];
+    });
+    return [bad containsObject:name];
 }
 
 static void loadPrefs(void) {
+    if (isForbiddenDaemon()) return;
+
     if (imageCache) [imageCache removeAllObjects];
     else imageCache = [NSMutableDictionary new];
 
-    // ----- CFPreferences（所有进程都安全）-----
+    isEnabled = NO;
+    customIconsDict = nil;
+
     @try {
         CFPreferencesAppSynchronize(PREFS_DOMAIN);
     } @catch (NSException *e) {}
 
     Boolean keyExists = false;
-    Boolean enVal = false;
+    Boolean enVal = true;
     @try {
         enVal = CFPreferencesGetAppBooleanValue(CFSTR("Enabled"), PREFS_DOMAIN, &keyExists);
     } @catch (NSException *e) {}
 
-    NSDictionary *prefIcons = nil;
-    @try {
-        CFPropertyListRef ref = CFPreferencesCopyAppValue(CFSTR("IOSDump_CSI_Icons"), PREFS_DOMAIN);
-        if (!ref) ref = CFPreferencesCopyAppValue(CFSTR("IOSDump_CSI_Icons"), kCFPreferencesAnyApplication);
-        if (ref && CFGetTypeID(ref) == CFDictionaryGetTypeID()) {
-            prefIcons = [(__bridge NSDictionary *)ref copy];
-        }
-        if (ref) CFRelease(ref);
-    } @catch (NSException *e) {}
-
-    // ----- 共享缓存（仅非沙盒进程）-----
-    NSDictionary *cache = safeReadSharedCache();
-    NSDictionary *cacheIcons = nil;
-    BOOL cacheEnabled = YES;
-    if (cache) {
-        id ce = cache[@"Enabled"];
-        if ([ce respondsToSelector:@selector(boolValue)]) cacheEnabled = [ce boolValue];
-        id ci = cache[@"IOSDump_CSI_Icons"];
-        if ([ci isKindOfClass:[NSDictionary class]]) cacheIcons = ci;
-    }
-
-    // 偏好 Enabled 优先
     if (keyExists && !enVal) {
         isEnabled = NO;
-        customIconsDict = nil;
-        if (isSpringBoardProcess()) writeSharedCache(nil, NO);
-        return;
-    }
-    if (cache && !cacheEnabled) {
-        isEnabled = NO;
-        customIconsDict = nil;
         return;
     }
 
-    if (prefIcons.count > 0) {
-        customIconsDict = prefIcons;
-        isEnabled = YES;
-    } else if (cacheIcons.count > 0 && cacheEnabled) {
-        customIconsDict = [cacheIcons copy];
+    NSDictionary *icons = nil;
+    @try {
+        CFPropertyListRef ref = CFPreferencesCopyAppValue(CFSTR("IOSDump_CSI_Icons"), PREFS_DOMAIN);
+        if (!ref) {
+            ref = CFPreferencesCopyAppValue(CFSTR("IOSDump_CSI_Icons"), kCFPreferencesAnyApplication);
+        }
+        if (ref) {
+            if (CFGetTypeID(ref) == CFDictionaryGetTypeID()) {
+                icons = [(__bridge NSDictionary *)ref copy];
+            }
+            CFRelease(ref);
+        }
+    } @catch (NSException *e) {}
+
+    if (icons.count > 0) {
+        customIconsDict = icons;
         isEnabled = YES;
     } else {
-        customIconsDict = nil;
         isEnabled = NO;
-    }
-
-    if (isSpringBoardProcess()) {
-        writeSharedCache(customIconsDict, isEnabled);
+        customIconsDict = nil;
     }
 }
 
@@ -173,7 +124,8 @@ static UIImage *getCustomIconForID(NSString *identifier) {
 
     for (NSString *key in customIconsDict) {
         if ([identifier caseInsensitiveCompare:key] == NSOrderedSame) {
-            base64 = customIconsDict[key]; break;
+            base64 = customIconsDict[key];
+            break;
         }
     }
     if (!base64) {
@@ -182,7 +134,8 @@ static UIImage *getCustomIconForID(NSString *identifier) {
             NSString *lk = key.lowercaseString;
             if ([lower containsString:lk] || [lk containsString:lower] ||
                 [lower hasPrefix:lk] || [lk hasPrefix:lower]) {
-                base64 = customIconsDict[key]; break;
+                base64 = customIconsDict[key];
+                break;
             }
         }
     }
@@ -193,7 +146,8 @@ static UIImage *getCustomIconForID(NSString *identifier) {
                 NSString *prefix = [[parts subarrayWithRange:NSMakeRange(0, len)] componentsJoinedByString:@"."];
                 for (NSString *key in customIconsDict) {
                     if ([prefix caseInsensitiveCompare:key] == NSOrderedSame) {
-                        base64 = customIconsDict[key]; break;
+                        base64 = customIconsDict[key];
+                        break;
                     }
                 }
                 if (base64) break;
@@ -454,9 +408,13 @@ static void applyToImageView(UIImageView *iv, UIImage *img) {
 %end
 
 %ctor {
+    // 绝对禁止进入 daemon，避免 SANDBOX kill
+    if (isForbiddenDaemon()) return;
+
     @try {
         loadPrefs();
     } @catch (NSException *e) {}
+
     CFNotificationCenterAddObserver(
         CFNotificationCenterGetDarwinNotifyCenter(),
         NULL,
