@@ -25,7 +25,7 @@
 static BOOL isEnabled = YES;
 static NSDictionary *customIconsDict = nil;
 
-// 缓存池与线程锁 (彻底防止卡死核心机制)
+// 缓存池与线程锁 (防止模糊匹配造成性能浪费)
 static NSMutableDictionary *imageCache = nil;
 static NSLock *cacheLock = nil;
 
@@ -68,7 +68,7 @@ static void loadPrefs() {
     }
     if (ref) CFRelease(ref);
     
-    // 3. 沙盒进程兜底：如果 CFPreferences 读取不到，直接读物理文件
+    // 3. 沙盒进程兜底：如果 CFPreferences 没拿到，直接读文件
     if (!tempIcons || tempIcons.count == 0) {
         NSDictionary *fileDict = [NSDictionary dictionaryWithContentsOfFile:PREFS_PATH];
         if (fileDict) {
@@ -89,11 +89,11 @@ static void loadPrefs() {
     [imageCache removeAllObjects];
     [cacheLock unlock];
 
-    NSLog(@"[CustomShareIcon] 加载成功: enabled=%d, icons=%lu", isEnabled, (unsigned long)customIconsDict.count);
+    NSLog(@"[CustomShareIcon] 偏好加载成功: enabled=%d, icons=%lu", isEnabled, (unsigned long)customIconsDict.count);
     reloadActiveUIs();
 }
 
-#pragma mark - 标识符提取与匹配 (0卡死优化)
+#pragma mark - 标识符提取与匹配
 
 static NSString *cleanBundleID(NSString *bid) {
     if (!bid || bid.length == 0) return nil;
@@ -110,7 +110,7 @@ static UIImage *getCustomIconForID(NSString *identifier) {
     NSString *cleanID = cleanBundleID(identifier);
     if (!cleanID.length) return nil;
     
-    // 【防卡死核心】：优先查询缓存，不管是图片还是未匹配标记 (NSNull)
+    // O(1) 速度返回缓存，拦截不存在的标识符防止卡顿
     [cacheLock lock];
     id cachedObj = imageCache[cleanID];
     [cacheLock unlock];
@@ -140,7 +140,7 @@ static UIImage *getCustomIconForID(NSString *identifier) {
         }
     }
     
-    // 如果没有找到，将 NSNull 写入缓存，下次遇到直接跳过，杜绝死循环卡死！
+    // 如果没有找到，将 NSNull 写入缓存，下次绝不重复搜索！
     if (!base64) {
         [cacheLock lock];
         imageCache[cleanID] = [NSNull null];
@@ -181,7 +181,7 @@ static NSString *bundleIDFromActivity(id activity) {
             r = [ext valueForKey:@"identifier"];
             if (r.length) return cleanBundleID(r);
             id bundle = [ext valueForKey:@"_bundle"];
-            if (bundle) {
+            if (bundle && [bundle respondsToSelector:@selector(bundleIdentifier)]) {
                 r = [bundle bundleIdentifier];
                 if (r.length) return cleanBundleID(r);
             }
@@ -249,7 +249,7 @@ static NSString *extractIdentifier(id proxy) {
 }
 %end
 
-#pragma mark - 主面板 Cell (覆盖正方形图标)
+#pragma mark - 主面板 Cell (防死锁安全覆盖方案)
 
 %hook UIShareGroupActivityCell
 
@@ -261,60 +261,78 @@ static NSString *extractIdentifier(id proxy) {
 - (void)prepareForReuse {
     %orig;
     UIImageView *ov = [self.contentView viewWithTag:TAG_CUSTOM_ICON];
-    if (ov) { ov.hidden = YES; ov.image = nil; }
+    // 这里也要防重复调用
+    if (ov && !ov.hidden) {
+        ov.hidden = YES;
+        ov.image = nil;
+    }
+    
+    UIView *nativeIv = nil;
+    @try { nativeIv = [self valueForKey:@"activityImageView"]; } @catch (NSException *e) {}
+    if (nativeIv && nativeIv.hidden) {
+        nativeIv.hidden = NO;
+    }
 }
 
 %new
 - (void)csi_applyCustomIcon {
     UIImageView *ov = [self.contentView viewWithTag:TAG_CUSTOM_ICON];
+    
+    UIView *nativeIv = nil;
+    UIView *slotView = nil;
+    @try {
+        if ([self respondsToSelector:@selector(activityImageView)]) nativeIv = [self valueForKey:@"activityImageView"];
+        if ([self respondsToSelector:@selector(imageSlotView)]) slotView = [self valueForKey:@"imageSlotView"];
+    } @catch(NSException *e) {}
+    
+    UIView *ref = (nativeIv && nativeIv.frame.size.width > 10) ? nativeIv : slotView;
+    
     if (!isEnabled) {
-        if (ov) { ov.hidden = YES; ov.image = nil; }
+        if (ov && !ov.hidden) { ov.hidden = YES; ov.image = nil; }
+        if (nativeIv && nativeIv.hidden) { nativeIv.hidden = NO; }
         return;
     }
 
     id proxy = nil;
-    @try { proxy = [self valueForKey:@"activityProxy"]; } @catch (NSException *e) {}
+    @try { proxy = [self valueForKey:@"activityProxy"]; } @catch(NSException *e) {}
     NSString *identifier = extractIdentifier(proxy);
     UIImage *img = identifier.length ? getCustomIconForID(identifier) : nil;
     
     if (!img) {
-        if (ov) { ov.hidden = YES; ov.image = nil; }
+        if (ov && !ov.hidden) { ov.hidden = YES; ov.image = nil; }
+        if (nativeIv && nativeIv.hidden) { nativeIv.hidden = NO; }
         return;
     }
 
-    UIImageView *nativeIv = nil;
-    UIView *slotView = nil;
-    @try { 
-        nativeIv = [self valueForKey:@"activityImageView"];
-        slotView = [self valueForKey:@"imageSlotView"];
-    } @catch (NSException *e) {}
-    
-    UIView *ref = (nativeIv && nativeIv.frame.size.width > 10) ? (UIView *)nativeIv : slotView;
     if (!ref || CGRectIsEmpty(ref.frame)) return;
 
-    if (nativeIv) {
-        nativeIv.hidden = YES; // 彻底隐藏系统的图片，防止圆角干扰
+    // 【核心修复】：只有属性确实不一样时，才去改，防止触发 layoutSubviews 的无限死循环死锁
+    if (nativeIv && !nativeIv.hidden) {
+        nativeIv.hidden = YES; 
     }
 
     if (!ov) {
-        ov = [UIImageView new];
+        ov = [[UIImageView alloc] initWithFrame:ref.frame];
         ov.tag = TAG_CUSTOM_ICON;
         ov.contentMode = UIViewContentModeScaleAspectFit;
         ov.clipsToBounds = YES;
         ov.userInteractionEnabled = NO;
-        [self.contentView addSubview:ov];
+        ov.layer.cornerRadius = 0; // 强制无圆角（正方形）
+        // 原生位置覆盖，不破坏原有的徽标(角标)Z轴图层关系
+        [self.contentView insertSubview:ov aboveSubview:ref]; 
     }
     
-    ov.frame = ref.frame;
-    ov.layer.cornerRadius = 0; // 强制正方形！没有任何圆角！
-    ov.image = img;
-    ov.hidden = NO;
-    [self.contentView bringSubviewToFront:ov];
-
-    @try {
-        UIView *badge = [self valueForKey:@"badgeSlotView"];
-        if (badge) [self.contentView bringSubviewToFront:badge];
-    } @catch (NSException *e) {}
+    if (!CGRectEqualToRect(ov.frame, ref.frame)) {
+        ov.frame = ref.frame;
+    }
+    
+    if (ov.image != img) {
+        ov.image = img;
+    }
+    
+    if (ov.hidden) {
+        ov.hidden = NO;
+    }
 }
 
 %end
@@ -329,8 +347,8 @@ static NSString *extractIdentifier(id proxy) {
     UIImageView *ov = [cell.contentView viewWithTag:TAG_CUSTOM_ICON];
 
     if (!isEnabled) {
-        if (ov) ov.hidden = YES;
-        cell.imageView.hidden = NO;
+        if (ov && !ov.hidden) ov.hidden = YES;
+        if (cell.imageView.hidden) cell.imageView.hidden = NO;
         return;
     }
 
@@ -344,35 +362,44 @@ static NSString *extractIdentifier(id proxy) {
     UIImage *img = getCustomIconForID(bid);
     
     if (!img) {
-        if (ov) ov.hidden = YES;
-        cell.imageView.hidden = NO;
+        if (ov && !ov.hidden) ov.hidden = YES;
+        if (cell.imageView.hidden) cell.imageView.hidden = NO;
         return;
     }
 
     UIImageView *sysIv = cell.imageView;
-    sysIv.hidden = YES; // 必须隐藏原生 View，规避原生系统内置的图片属性束缚
+    if (sysIv && !sysIv.hidden) {
+        sysIv.hidden = YES; 
+    }
 
     if (!ov) {
         ov = [UIImageView new];
         ov.tag = TAG_CUSTOM_ICON;
         ov.contentMode = UIViewContentModeScaleAspectFit;
         ov.clipsToBounds = YES;
-        ov.layer.cornerRadius = 0; // 强制正方形！
+        ov.layer.cornerRadius = 0; // 强制正方形
         [cell.contentView addSubview:ov];
     }
     
-    // 自动抓取系统 ImageView 的位置坐标
+    CGRect targetFrame;
     if (sysIv && !CGRectIsEmpty(sysIv.frame)) {
-        ov.frame = sysIv.frame;
+        targetFrame = sysIv.frame;
     } else {
-        // 兜底坐标尺寸
         CGFloat size = 29.0;
-        ov.frame = CGRectMake(16, (cell.bounds.size.height - size) / 2.0, size, size);
+        targetFrame = CGRectMake(16, (cell.bounds.size.height - size) / 2.0, size, size);
     }
     
-    ov.image = img;
-    ov.hidden = NO;
-    [cell.contentView bringSubviewToFront:ov];
+    if (!CGRectEqualToRect(ov.frame, targetFrame)) {
+        ov.frame = targetFrame;
+    }
+    
+    if (ov.image != img) {
+        ov.image = img;
+    }
+    
+    if (ov.hidden) {
+        ov.hidden = NO;
+    }
 }
 
 %end
