@@ -1,9 +1,10 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <unistd.h>
 
 #define TAG_CUSTOM_ICON 998877
 #define PREFS_DOMAIN CFSTR("com.iosdump.customshareicon")
-#define SHARED_CACHE_PATH @"/var/mobile/Library/Preferences/com.iosdump.customshareicon.shared.plist"
+#define SHARED_CACHE_PATH "/var/mobile/Library/Preferences/com.iosdump.customshareicon.shared.plist"
 
 @interface UIShareGroupActivityCell : UICollectionViewCell
 @property (nonatomic, strong) id activityProxy;
@@ -42,68 +43,95 @@ static BOOL isEnabled = NO;
 static NSDictionary *customIconsDict = nil;
 static NSMutableDictionary *imageCache = nil;
 
-static BOOL isSpringBoardProcess() {
+static BOOL isSpringBoardProcess(void) {
     NSString *bid = [NSBundle mainBundle].bundleIdentifier;
     if ([bid isEqualToString:@"com.apple.springboard"]) return YES;
     if ([[[NSProcessInfo processInfo] processName] isEqualToString:@"SpringBoard"]) return YES;
     return NO;
 }
 
-static void writeSharedCache(NSDictionary *icons, BOOL enabled) {
-    NSDictionary *obj = @{
-        @"Enabled" : @(enabled),
-        @"IOSDump_CSI_Icons" : (icons ?: @{}),
-        @"ts" : @([[NSDate date] timeIntervalSince1970])
-    };
-    [obj writeToFile:SHARED_CACHE_PATH atomically:YES];
-    NSLog(@"[CustomShareIcon] 写共享缓存 enabled=%d count=%lu", enabled, (unsigned long)(icons.count));
+// 沙盒进程禁止碰共享缓存文件
+static BOOL canTouchSharedCacheFile(void) {
+    if (isSpringBoardProcess()) return YES;
+    NSString *bid = [NSBundle mainBundle].bundleIdentifier ?: @"";
+    // Preferences 设置页可以写
+    if ([bid isEqualToString:@"com.apple.Preferences"]) return YES;
+    // 普通 App（/var/mobile）可读；daemon 一律不碰文件
+    NSString *home = NSHomeDirectory() ?: @"";
+    if ([home hasPrefix:@"/var/mobile"]) return YES;
+    return NO;
 }
 
-static void loadPrefs() {
+static void writeSharedCache(NSDictionary *icons, BOOL enabled) {
+    if (!canTouchSharedCacheFile()) return;
+    if (!isSpringBoardProcess() && ![[NSBundle mainBundle].bundleIdentifier isEqualToString:@"com.apple.Preferences"]) return;
+
+    @try {
+        NSDictionary *obj = @{
+            @"Enabled" : @(enabled),
+            @"IOSDump_CSI_Icons" : (icons ?: @{}),
+            @"ts" : @([[NSDate date] timeIntervalSince1970])
+        };
+        [obj writeToFile:@(SHARED_CACHE_PATH) atomically:YES];
+    } @catch (NSException *e) {}
+}
+
+static NSDictionary *safeReadSharedCache(void) {
+    if (!canTouchSharedCacheFile()) return nil;
+    if (access(SHARED_CACHE_PATH, R_OK) != 0) return nil;
+    @try {
+        NSDictionary *cache = [NSDictionary dictionaryWithContentsOfFile:@(SHARED_CACHE_PATH)];
+        if ([cache isKindOfClass:[NSDictionary class]]) return cache;
+    } @catch (NSException *e) {}
+    return nil;
+}
+
+static void loadPrefs(void) {
     if (imageCache) [imageCache removeAllObjects];
     else imageCache = [NSMutableDictionary new];
 
-    // 1) 先读真实偏好里的 Enabled（最高优先级）
-    CFPreferencesAppSynchronize(PREFS_DOMAIN);
-    CFPreferencesAppSynchronize(kCFPreferencesAnyApplication);
+    // ----- CFPreferences（所有进程都安全）-----
+    @try {
+        CFPreferencesAppSynchronize(PREFS_DOMAIN);
+    } @catch (NSException *e) {}
+
     Boolean keyExists = false;
-    Boolean enVal = CFPreferencesGetAppBooleanValue(CFSTR("Enabled"), PREFS_DOMAIN, &keyExists);
-    if (!keyExists) {
-        enVal = CFPreferencesGetAppBooleanValue(CFSTR("Enabled"), kCFPreferencesAnyApplication, &keyExists);
-    }
+    Boolean enVal = false;
+    @try {
+        enVal = CFPreferencesGetAppBooleanValue(CFSTR("Enabled"), PREFS_DOMAIN, &keyExists);
+    } @catch (NSException *e) {}
 
-    CFPropertyListRef ref = CFPreferencesCopyAppValue(CFSTR("IOSDump_CSI_Icons"), PREFS_DOMAIN);
-    if (!ref) ref = CFPreferencesCopyAppValue(CFSTR("IOSDump_CSI_Icons"), kCFPreferencesAnyApplication);
     NSDictionary *prefIcons = nil;
-    if (ref && CFGetTypeID(ref) == CFDictionaryGetTypeID()) {
-        prefIcons = [(__bridge NSDictionary *)ref copy];
-    }
-    if (ref) CFRelease(ref);
+    @try {
+        CFPropertyListRef ref = CFPreferencesCopyAppValue(CFSTR("IOSDump_CSI_Icons"), PREFS_DOMAIN);
+        if (!ref) ref = CFPreferencesCopyAppValue(CFSTR("IOSDump_CSI_Icons"), kCFPreferencesAnyApplication);
+        if (ref && CFGetTypeID(ref) == CFDictionaryGetTypeID()) {
+            prefIcons = [(__bridge NSDictionary *)ref copy];
+        }
+        if (ref) CFRelease(ref);
+    } @catch (NSException *e) {}
 
-    // 2) 读共享缓存
-    NSDictionary *cache = [NSDictionary dictionaryWithContentsOfFile:SHARED_CACHE_PATH];
+    // ----- 共享缓存（仅非沙盒进程）-----
+    NSDictionary *cache = safeReadSharedCache();
     NSDictionary *cacheIcons = nil;
     BOOL cacheEnabled = YES;
-    if ([cache isKindOfClass:[NSDictionary class]]) {
+    if (cache) {
         id ce = cache[@"Enabled"];
         if ([ce respondsToSelector:@selector(boolValue)]) cacheEnabled = [ce boolValue];
         id ci = cache[@"IOSDump_CSI_Icons"];
         if ([ci isKindOfClass:[NSDictionary class]]) cacheIcons = ci;
     }
 
-    // 3) 决策：真实偏好 Enabled 存在时以它为准
+    // 偏好 Enabled 优先
     if (keyExists && !enVal) {
         isEnabled = NO;
         customIconsDict = nil;
         if (isSpringBoardProcess()) writeSharedCache(nil, NO);
-        NSLog(@"[CustomShareIcon] 已关闭 (偏好)");
         return;
     }
-
     if (cache && !cacheEnabled) {
         isEnabled = NO;
         customIconsDict = nil;
-        NSLog(@"[CustomShareIcon] 已关闭 (共享缓存)");
         return;
     }
 
@@ -118,19 +146,16 @@ static void loadPrefs() {
         isEnabled = NO;
     }
 
-    NSLog(@"[CustomShareIcon] loadPrefs enabled=%d count=%lu keys=%@", isEnabled,
-          (unsigned long)customIconsDict.count, customIconsDict.allKeys ?: @[]);
-
     if (isSpringBoardProcess()) {
         writeSharedCache(customIconsDict, isEnabled);
     }
 }
 
-static UIImage *roundedImage(UIImage *img, CGFloat cornerRatio) {
+static UIImage *roundedImage(UIImage *img, CGFloat ratio) {
     if (!img) return nil;
     CGSize size = img.size;
     if (size.width < 1 || size.height < 1) return img;
-    CGFloat radius = MIN(size.width, size.height) * cornerRatio;
+    CGFloat radius = MIN(size.width, size.height) * ratio;
     UIGraphicsBeginImageContextWithOptions(size, NO, img.scale);
     [[UIBezierPath bezierPathWithRoundedRect:CGRectMake(0, 0, size.width, size.height) cornerRadius:radius] addClip];
     [img drawInRect:CGRectMake(0, 0, size.width, size.height)];
@@ -181,10 +206,8 @@ static UIImage *getCustomIconForID(NSString *identifier) {
     if (!data) return nil;
     UIImage *img = [UIImage imageWithData:data scale:3.0];
     if (!img) return nil;
-
     img = roundedImage(img, 0.2237);
     imageCache[identifier] = img;
-    NSLog(@"[CustomShareIcon] ✅ %@", identifier);
     return img;
 }
 
@@ -206,11 +229,6 @@ static NSString *bundleIDFromActivity(id activity) {
             } @catch (NSException *e) {}
             r = [ext valueForKey:@"identifier"];
             if (r.length) return r;
-            id bundle = [ext valueForKey:@"_bundle"];
-            if (bundle) {
-                r = [bundle bundleIdentifier];
-                if (r.length) return r;
-            }
         }
     } @catch (NSException *e) {}
     @try {
@@ -244,20 +262,6 @@ static NSString *extractIdentifier(id proxy) {
     return nil;
 }
 
-static BOOL isInShareSheetContext(UIView *view) {
-    UIResponder *r = view;
-    int d = 0;
-    while (r && d < 16) {
-        NSString *cls = NSStringFromClass([r class]);
-        if ([cls containsString:@"Preferences"] || [cls containsString:@"PSList"]) return NO;
-        if ([cls containsString:@"UIActivity"] || [cls containsString:@"SHSheet"] ||
-            [cls containsString:@"ShareSheet"] || [cls containsString:@"UserDefaults"]) return YES;
-        r = [r nextResponder];
-        d++;
-    }
-    return NO;
-}
-
 static void applyToImageView(UIImageView *iv, UIImage *img) {
     if (!iv || !img) return;
     iv.image = img;
@@ -279,7 +283,8 @@ static void applyToImageView(UIImageView *iv, UIImage *img) {
 
 + (id)_activityImageForBundleImageConfiguration:(id)configuration {
     if (configuration) {
-        NSString *path = [configuration valueForKey:@"bundlePath"];
+        NSString *path = nil;
+        @try { path = [configuration valueForKey:@"bundlePath"]; } @catch (NSException *e) {}
         if (path.length) {
             NSString *last = [[path lastPathComponent] stringByDeletingPathExtension];
             UIImage *c = getCustomIconForID(last);
@@ -364,12 +369,10 @@ static void applyToImageView(UIImageView *iv, UIImage *img) {
 %new
 - (void)csi_applyCustomIcon {
     UIImageView *ov = [self.contentView viewWithTag:TAG_CUSTOM_ICON];
-
     if (!isEnabled) {
         if (ov) { ov.hidden = YES; ov.image = nil; }
         return;
     }
-
     NSString *identifier = extractIdentifier([self valueForKey:@"activityProxy"]);
     UIImage *img = identifier.length ? getCustomIconForID(identifier) : nil;
     if (!img) {
@@ -377,8 +380,10 @@ static void applyToImageView(UIImageView *iv, UIImage *img) {
         return;
     }
 
-    UIImageView *nativeIv = [self valueForKey:@"activityImageView"];
-    UIView *slotView = [self valueForKey:@"imageSlotView"];
+    UIImageView *nativeIv = nil;
+    UIView *slotView = nil;
+    @try { nativeIv = [self valueForKey:@"activityImageView"]; } @catch (NSException *e) {}
+    @try { slotView = [self valueForKey:@"imageSlotView"]; } @catch (NSException *e) {}
     UIView *ref = (nativeIv && nativeIv.frame.size.width > 10) ? (UIView *)nativeIv : slotView;
     if (!ref || CGRectIsEmpty(ref.frame)) return;
 
@@ -408,7 +413,8 @@ static void applyToImageView(UIImageView *iv, UIImage *img) {
     ov.hidden = NO;
     [self.contentView bringSubviewToFront:ov];
 
-    UIView *badge = [self valueForKey:@"badgeSlotView"];
+    UIView *badge = nil;
+    @try { badge = [self valueForKey:@"badgeSlotView"]; } @catch (NSException *e) {}
     if (badge) [self.contentView bringSubviewToFront:badge];
 }
 
@@ -421,12 +427,11 @@ static void applyToImageView(UIImageView *iv, UIImage *img) {
 - (id)cellForItemIdentifier:(id)identifier {
     id cell = %orig;
     if (!isEnabled || !cell) return cell;
-
     id activity = nil;
-    NSDictionary *byUUID = [self valueForKey:@"activitiesByUUID"];
+    NSDictionary *byUUID = nil;
+    @try { byUUID = [self valueForKey:@"activitiesByUUID"]; } @catch (NSException *e) {}
     if (identifier && byUUID) activity = byUUID[identifier];
     if (!activity) return cell;
-
     UIImage *img = getCustomIconForID(bundleIDFromActivity(activity));
     if (img && [cell respondsToSelector:@selector(imageView)]) {
         applyToImageView([cell imageView], img);
@@ -437,38 +442,27 @@ static void applyToImageView(UIImageView *iv, UIImage *img) {
 - (void)tableView:(UITableView *)tableView willDisplayCell:(UITableViewCell *)cell forRowAtIndexPath:(NSIndexPath *)indexPath {
     %orig;
     if (!isEnabled || !cell) return;
-
     id activity = nil;
     if ([self respondsToSelector:@selector(activityForRowAtIndexPath:)]) {
-        activity = [self activityForRowAtIndexPath:indexPath];
+        @try { activity = [self activityForRowAtIndexPath:indexPath]; } @catch (NSException *e) {}
     }
     if (!activity) return;
-
     UIImage *img = getCustomIconForID(bundleIDFromActivity(activity));
     if (img) applyToImageView(cell.imageView, img);
 }
 
 %end
 
-%hook UITableViewCell
-
-- (void)layoutSubviews {
-    %orig;
-    if (!isEnabled || !customIconsDict.count) return;
-    if (!isInShareSheetContext(self)) return;
-    if (!self.imageView || self.imageView.frame.size.width < 24) return;
-
-    // 更多列表兜底：用已缓存的自定义图无法从 cell 反查 id，这里不强制替换
-    // 主要依赖 UserDefaults VC 的 willDisplay / cellForItemIdentifier
-}
-
-%end
-
 %ctor {
-    NSLog(@"[CustomShareIcon] 完美版加载");
-    loadPrefs();
-    CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
-                                    NULL, (CFNotificationCallback)loadPrefs,
-                                    CFSTR("com.iosdump.customshareicon/ReloadPrefs"),
-                                    NULL, CFNotificationSuspensionBehaviorCoalesce);
+    @try {
+        loadPrefs();
+    } @catch (NSException *e) {}
+    CFNotificationCenterAddObserver(
+        CFNotificationCenterGetDarwinNotifyCenter(),
+        NULL,
+        (CFNotificationCallback)loadPrefs,
+        CFSTR("com.iosdump.customshareicon/ReloadPrefs"),
+        NULL,
+        CFNotificationSuspensionBehaviorCoalesce
+    );
 }
