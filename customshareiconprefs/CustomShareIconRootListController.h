@@ -5,8 +5,8 @@
 @property (nonatomic, strong) NSMutableDictionary *iconsDict;
 @property (nonatomic, copy) NSString *pendingBundleID;
 
-// 修改为读取文件的声明
-- (void)loadIconsFromFiles;
+- (void)loadIconsFromPrefs;
+- (void)saveIconsToPrefs;
 - (void)notifyReload;
 - (void)addNewIcon;
 - (void)pickImageForKey:(NSString *)key;
