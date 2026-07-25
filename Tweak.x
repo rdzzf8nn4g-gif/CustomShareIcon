@@ -25,9 +25,8 @@
 static BOOL isEnabled = YES;
 static NSDictionary *customIconsDict = nil;
 
-// 缓存池与线程锁 (防止模糊匹配造成性能浪费)
+// 缓存池 (彻底防止卡死核心机制)
 static NSMutableDictionary *imageCache = nil;
-static NSLock *cacheLock = nil;
 
 // 实时刷新收集器
 static NSHashTable *activeShareVCs = nil;
@@ -68,7 +67,7 @@ static void loadPrefs() {
     }
     if (ref) CFRelease(ref);
     
-    // 3. 沙盒进程兜底：如果 CFPreferences 没拿到，直接读文件
+    // 3. 沙盒进程兜底：如果 CFPreferences 拿不到，直接读物理文件
     if (!tempIcons || tempIcons.count == 0) {
         NSDictionary *fileDict = [NSDictionary dictionaryWithContentsOfFile:PREFS_PATH];
         if (fileDict) {
@@ -81,19 +80,18 @@ static void loadPrefs() {
     // 4. 重置缓存池，让设置里的更改立即生效
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^{
-        cacheLock = [NSLock new];
         imageCache = [NSMutableDictionary new];
     });
     
-    [cacheLock lock];
-    [imageCache removeAllObjects];
-    [cacheLock unlock];
+    @synchronized (imageCache) {
+        [imageCache removeAllObjects];
+    }
 
     NSLog(@"[CustomShareIcon] 偏好加载成功: enabled=%d, icons=%lu", isEnabled, (unsigned long)customIconsDict.count);
     reloadActiveUIs();
 }
 
-#pragma mark - 标识符提取与匹配
+#pragma mark - 标识符安全提取与匹配 (0异常0卡死优化)
 
 static NSString *cleanBundleID(NSString *bid) {
     if (!bid || bid.length == 0) return nil;
@@ -110,26 +108,23 @@ static UIImage *getCustomIconForID(NSString *identifier) {
     NSString *cleanID = cleanBundleID(identifier);
     if (!cleanID.length) return nil;
     
-    // O(1) 速度返回缓存，拦截不存在的标识符防止卡顿
-    [cacheLock lock];
-    id cachedObj = imageCache[cleanID];
-    [cacheLock unlock];
-    
-    if (cachedObj) {
-        return cachedObj == [NSNull null] ? nil : (UIImage *)cachedObj;
+    // 【防卡死核心】：极速缓存，命中直接返回，包含找不到的 NSNull
+    @synchronized (imageCache) {
+        id cachedObj = imageCache[cleanID];
+        if (cachedObj) {
+            return cachedObj == [NSNull null] ? nil : (UIImage *)cachedObj;
+        }
     }
 
     NSString *base64 = nil;
     NSString *lower = cleanID.lowercaseString;
 
-    // 精确匹配
     for (NSString *key in customIconsDict) {
         if ([lower caseInsensitiveCompare:key] == NSOrderedSame) {
             base64 = customIconsDict[key]; break;
         }
     }
     
-    // 模糊包含匹配
     if (!base64) {
         for (NSString *key in customIconsDict) {
             if (key.length < 3) continue;
@@ -140,11 +135,9 @@ static UIImage *getCustomIconForID(NSString *identifier) {
         }
     }
     
-    // 如果没有找到，将 NSNull 写入缓存，下次绝不重复搜索！
+    // 找不到就锁死 NSNull，杜绝死循环
     if (!base64) {
-        [cacheLock lock];
-        imageCache[cleanID] = [NSNull null];
-        [cacheLock unlock];
+        @synchronized (imageCache) { imageCache[cleanID] = [NSNull null]; }
         return nil;
     }
 
@@ -153,83 +146,78 @@ static UIImage *getCustomIconForID(NSString *identifier) {
     
     UIImage *img = [UIImage imageWithData:data scale:3.0];
     
-    [cacheLock lock];
-    if (img) {
-        imageCache[cleanID] = img;
-    } else {
-        imageCache[cleanID] = [NSNull null];
+    @synchronized (imageCache) {
+        if (img) {
+            imageCache[cleanID] = img;
+        } else {
+            imageCache[cleanID] = [NSNull null];
+        }
     }
-    [cacheLock unlock];
-    
     return img;
 }
 
+// 使用安全无耗时的 performSelector 替代灾难级的 @try-@catch
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
 static NSString *bundleIDFromActivity(id activity) {
     if (!activity) return nil;
-    NSString *r = nil;
 
-    @try {
-        if ([activity respondsToSelector:@selector(containingAppBundleIdentifier)]) {
-            r = [activity valueForKey:@"containingAppBundleIdentifier"];
-            if (r.length) return cleanBundleID(r);
-        }
-    } @catch (NSException *e) {}
+    if ([activity respondsToSelector:@selector(containingAppBundleIdentifier)]) {
+        NSString *r = [activity performSelector:@selector(containingAppBundleIdentifier)];
+        if (r.length) return cleanBundleID(r);
+    }
 
-    @try {
-        id ext = [activity valueForKey:@"applicationExtension"];
+    if ([activity respondsToSelector:@selector(applicationExtension)]) {
+        id ext = [activity performSelector:@selector(applicationExtension)];
         if (ext) {
-            r = [ext valueForKey:@"identifier"];
-            if (r.length) return cleanBundleID(r);
-            id bundle = [ext valueForKey:@"_bundle"];
-            if (bundle && [bundle respondsToSelector:@selector(bundleIdentifier)]) {
-                r = [bundle bundleIdentifier];
+            if ([ext respondsToSelector:@selector(identifier)]) {
+                NSString *r = [ext performSelector:@selector(identifier)];
                 if (r.length) return cleanBundleID(r);
             }
+            if ([ext respondsToSelector:@selector(_bundle)]) {
+                id bundle = [ext performSelector:@selector(_bundle)];
+                if (bundle && [bundle respondsToSelector:@selector(bundleIdentifier)]) {
+                    NSString *r = [bundle performSelector:@selector(bundleIdentifier)];
+                    if (r.length) return cleanBundleID(r);
+                }
+            }
         }
-    } @catch (NSException *e) {}
+    }
 
-    @try {
-        if ([activity respondsToSelector:@selector(activityType)]) {
-            r = [activity valueForKey:@"activityType"];
-            if (r.length) return cleanBundleID(r);
-        }
-    } @catch (NSException *e) {}
+    if ([activity respondsToSelector:@selector(activityType)]) {
+        NSString *r = [activity performSelector:@selector(activityType)];
+        if (r.length) return cleanBundleID(r);
+    }
 
     return nil;
 }
 
 static NSString *extractIdentifier(id proxy) {
     if (!proxy) return nil;
-    NSString *r = nil;
 
-    @try {
-        if ([proxy respondsToSelector:@selector(applicationBundleIdentifier)]) {
-            r = [proxy valueForKey:@"applicationBundleIdentifier"];
-            if (r.length) return cleanBundleID(r);
-        }
-    } @catch (NSException *e) {}
+    if ([proxy respondsToSelector:@selector(applicationBundleIdentifier)]) {
+        NSString *r = [proxy performSelector:@selector(applicationBundleIdentifier)];
+        if (r.length) return cleanBundleID(r);
+    }
 
     id activity = nil;
-    @try {
-        if ([proxy respondsToSelector:@selector(activity)]) {
-            activity = [proxy valueForKey:@"activity"];
-        } else {
-            activity = proxy;
-        }
-    } @catch (NSException *e) {}
+    if ([proxy respondsToSelector:@selector(activity)]) {
+        activity = [proxy performSelector:@selector(activity)];
+    } else {
+        activity = proxy;
+    }
 
-    r = bundleIDFromActivity(activity);
+    NSString *r = bundleIDFromActivity(activity);
     if (r.length) return r;
 
-    @try {
-        if ([proxy respondsToSelector:@selector(activityType)]) {
-            r = [proxy valueForKey:@"activityType"];
-            if (r.length) return cleanBundleID(r);
-        }
-    } @catch (NSException *e) {}
+    if ([proxy respondsToSelector:@selector(activityType)]) {
+        NSString *type = [proxy performSelector:@selector(activityType)];
+        if (type.length) return cleanBundleID(type);
+    }
 
     return nil;
 }
+#pragma clang diagnostic pop
 
 #pragma mark - 收集面板 VC 进行实时刷新
 
@@ -249,28 +237,33 @@ static NSString *extractIdentifier(id proxy) {
 }
 %end
 
-#pragma mark - 主面板 Cell (防死锁安全覆盖方案)
+#pragma mark - 主面板 Cell (防死锁安全覆盖)
 
 %hook UIShareGroupActivityCell
 
+// 【核心修复】：完全移除了 layoutSubviews 的 Hook，只在内容更新时触发，彻底斩断死循环！
 - (void)setActivityProxy:(id)proxy { %orig; [self csi_applyCustomIcon]; }
-- (void)layoutSubviews { %orig; [self csi_applyCustomIcon]; }
 - (void)setImage:(UIImage *)image { %orig; [self csi_applyCustomIcon]; }
 - (void)_updateImageView { %orig; [self csi_applyCustomIcon]; }
 
 - (void)prepareForReuse {
     %orig;
     UIImageView *ov = [self.contentView viewWithTag:TAG_CUSTOM_ICON];
-    // 这里也要防重复调用
     if (ov && !ov.hidden) {
         ov.hidden = YES;
         ov.image = nil;
     }
     
     UIView *nativeIv = nil;
-    @try { nativeIv = [self valueForKey:@"activityImageView"]; } @catch (NSException *e) {}
-    if (nativeIv && nativeIv.hidden) {
-        nativeIv.hidden = NO;
+    if ([self respondsToSelector:@selector(activityImageView)]) {
+        #pragma clang diagnostic push
+        #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        nativeIv = [self performSelector:@selector(activityImageView)];
+        #pragma clang diagnostic pop
+    }
+    
+    if (nativeIv && nativeIv.alpha != 1.0) {
+        nativeIv.alpha = 1.0;
     }
 }
 
@@ -280,35 +273,46 @@ static NSString *extractIdentifier(id proxy) {
     
     UIView *nativeIv = nil;
     UIView *slotView = nil;
-    @try {
-        if ([self respondsToSelector:@selector(activityImageView)]) nativeIv = [self valueForKey:@"activityImageView"];
-        if ([self respondsToSelector:@selector(imageSlotView)]) slotView = [self valueForKey:@"imageSlotView"];
-    } @catch(NSException *e) {}
+    #pragma clang diagnostic push
+    #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+    if ([self respondsToSelector:@selector(activityImageView)]) {
+        nativeIv = [self performSelector:@selector(activityImageView)];
+    }
+    if ([self respondsToSelector:@selector(imageSlotView)]) {
+        slotView = [self performSelector:@selector(imageSlotView)];
+    }
+    #pragma clang diagnostic pop
     
     UIView *ref = (nativeIv && nativeIv.frame.size.width > 10) ? nativeIv : slotView;
     
     if (!isEnabled) {
         if (ov && !ov.hidden) { ov.hidden = YES; ov.image = nil; }
-        if (nativeIv && nativeIv.hidden) { nativeIv.hidden = NO; }
+        if (nativeIv && nativeIv.alpha != 1.0) { nativeIv.alpha = 1.0; }
         return;
     }
 
     id proxy = nil;
-    @try { proxy = [self valueForKey:@"activityProxy"]; } @catch(NSException *e) {}
+    if ([self respondsToSelector:@selector(activityProxy)]) {
+        #pragma clang diagnostic push
+        #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        proxy = [self performSelector:@selector(activityProxy)];
+        #pragma clang diagnostic pop
+    }
+    
     NSString *identifier = extractIdentifier(proxy);
     UIImage *img = identifier.length ? getCustomIconForID(identifier) : nil;
     
     if (!img) {
         if (ov && !ov.hidden) { ov.hidden = YES; ov.image = nil; }
-        if (nativeIv && nativeIv.hidden) { nativeIv.hidden = NO; }
+        if (nativeIv && nativeIv.alpha != 1.0) { nativeIv.alpha = 1.0; }
         return;
     }
 
     if (!ref || CGRectIsEmpty(ref.frame)) return;
 
-    // 【核心修复】：只有属性确实不一样时，才去改，防止触发 layoutSubviews 的无限死循环死锁
-    if (nativeIv && !nativeIv.hidden) {
-        nativeIv.hidden = YES; 
+    // 【防死锁核心】：改用 alpha = 0 来隐藏原图，绝不触发 layoutSubviews
+    if (nativeIv && nativeIv.alpha != 0.0) {
+        nativeIv.alpha = 0.0; 
     }
 
     if (!ov) {
@@ -317,9 +321,8 @@ static NSString *extractIdentifier(id proxy) {
         ov.contentMode = UIViewContentModeScaleAspectFit;
         ov.clipsToBounds = YES;
         ov.userInteractionEnabled = NO;
-        ov.layer.cornerRadius = 0; // 强制无圆角（正方形）
-        // 原生位置覆盖，不破坏原有的徽标(角标)Z轴图层关系
-        [self.contentView insertSubview:ov aboveSubview:ref]; 
+        ov.layer.cornerRadius = 0; // 强制无圆角（直角正方形）
+        [self.contentView addSubview:ov]; 
     }
     
     if (!CGRectEqualToRect(ov.frame, ref.frame)) {
@@ -332,6 +335,22 @@ static NSString *extractIdentifier(id proxy) {
     
     if (ov.hidden) {
         ov.hidden = NO;
+    }
+    
+    // 提升层级前先检查，避免不必要的重绘引发卡死
+    if ([self.contentView.subviews lastObject] != ov) {
+        [self.contentView bringSubviewToFront:ov];
+    }
+    
+    UIView *badge = nil;
+    if ([self respondsToSelector:@selector(badgeSlotView)]) {
+        #pragma clang diagnostic push
+        #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        badge = [self performSelector:@selector(badgeSlotView)];
+        #pragma clang diagnostic pop
+    }
+    if (badge && [self.contentView.subviews lastObject] != badge) {
+        [self.contentView bringSubviewToFront:badge];
     }
 }
 
@@ -348,13 +367,16 @@ static NSString *extractIdentifier(id proxy) {
 
     if (!isEnabled) {
         if (ov && !ov.hidden) ov.hidden = YES;
-        if (cell.imageView.hidden) cell.imageView.hidden = NO;
+        if (cell.imageView.alpha != 1.0) cell.imageView.alpha = 1.0;
         return;
     }
 
     id activity = nil;
     if ([self respondsToSelector:@selector(activityForRowAtIndexPath:)]) {
-        activity = [self activityForRowAtIndexPath:indexPath];
+        #pragma clang diagnostic push
+        #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        activity = [self performSelector:@selector(activityForRowAtIndexPath:) withObject:indexPath];
+        #pragma clang diagnostic pop
     }
     if (!activity) return;
 
@@ -363,13 +385,13 @@ static NSString *extractIdentifier(id proxy) {
     
     if (!img) {
         if (ov && !ov.hidden) ov.hidden = YES;
-        if (cell.imageView.hidden) cell.imageView.hidden = NO;
+        if (cell.imageView.alpha != 1.0) cell.imageView.alpha = 1.0;
         return;
     }
 
     UIImageView *sysIv = cell.imageView;
-    if (sysIv && !sysIv.hidden) {
-        sysIv.hidden = YES; 
+    if (sysIv && sysIv.alpha != 0.0) {
+        sysIv.alpha = 0.0; // 同样使用 alpha 规避重绘卡顿
     }
 
     if (!ov) {
@@ -377,7 +399,7 @@ static NSString *extractIdentifier(id proxy) {
         ov.tag = TAG_CUSTOM_ICON;
         ov.contentMode = UIViewContentModeScaleAspectFit;
         ov.clipsToBounds = YES;
-        ov.layer.cornerRadius = 0; // 强制正方形
+        ov.layer.cornerRadius = 0; // 强制正方形！
         [cell.contentView addSubview:ov];
     }
     
