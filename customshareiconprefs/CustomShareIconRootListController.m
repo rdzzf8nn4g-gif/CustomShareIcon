@@ -2,7 +2,9 @@
 #import <Preferences/PSSpecifier.h>
 #import <UIKit/UIKit.h>
 
-#define PREFS_DOMAIN CFSTR("com.iosdump.customshareicon")
+#define PREFS_ID @"com.iosdump.customshareicon"
+#define ICONS_KEY @"IOSDump_CSI_Icons"
+#define ENABLED_KEY @"Enabled"
 
 @implementation CustomShareIconRootListController
 
@@ -15,44 +17,68 @@
     return _specifiers;
 }
 
+#pragma mark - 偏好读写
+
 - (void)loadIconsFromPrefs {
-    CFPreferencesAppSynchronize(PREFS_DOMAIN);
-    CFPropertyListRef ref = CFPreferencesCopyAppValue(CFSTR("IOSDump_CSI_Icons"), PREFS_DOMAIN);
-    if (ref && CFGetTypeID(ref) == CFDictionaryGetTypeID()) {
-        self.iconsDict = [(__bridge NSDictionary *)ref mutableCopy];
+    CFPreferencesAppSynchronize(CFSTR("com.iosdump.customshareicon"));
+    id obj = CFBridgingRelease(CFPreferencesCopyAppValue(CFSTR("IOSDump_CSI_Icons"), CFSTR("com.iosdump.customshareicon")));
+    if ([obj isKindOfClass:[NSDictionary class]]) {
+        self.iconsDict = [obj mutableCopy];
     } else {
-        self.iconsDict = [NSMutableDictionary new];
+        NSDictionary *d = [[NSUserDefaults standardUserDefaults] persistentDomainForName:PREFS_ID];
+        id icons = d[ICONS_KEY];
+        if ([icons isKindOfClass:[NSDictionary class]]) {
+            self.iconsDict = [icons mutableCopy];
+        } else {
+            self.iconsDict = [NSMutableDictionary new];
+        }
     }
-    if (ref) CFRelease(ref);
 }
 
 - (void)saveIconsToPrefs {
     if (!self.iconsDict) self.iconsDict = [NSMutableDictionary new];
-    CFPreferencesSetAppValue(CFSTR("IOSDump_CSI_Icons"), (__bridge CFPropertyListRef)self.iconsDict, PREFS_DOMAIN);
-    CFPreferencesAppSynchronize(PREFS_DOMAIN);
+
+    CFPreferencesSetAppValue(CFSTR("IOSDump_CSI_Icons"), (__bridge CFPropertyListRef)self.iconsDict, CFSTR("com.iosdump.customshareicon"));
+    CFPreferencesAppSynchronize(CFSTR("com.iosdump.customshareicon"));
+
+    NSUserDefaults *ud = [[NSUserDefaults alloc] initWithSuiteName:PREFS_ID];
+    if (!ud) ud = [NSUserDefaults standardUserDefaults];
+    [ud setObject:self.iconsDict forKey:ICONS_KEY];
+    [ud synchronize];
+
     [self notifyReload];
 }
 
 - (void)notifyReload {
-    CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
-                                         CFSTR("com.iosdump.customshareicon/ReloadPrefs"),
-                                         NULL, NULL, true);
+    CFNotificationCenterPostNotification(
+        CFNotificationCenterGetDarwinNotifyCenter(),
+        CFSTR("com.iosdump.customshareicon/ReloadPrefs"),
+        NULL,
+        NULL,
+        true
+    );
 }
 
 #pragma mark - 开关
 
 - (id)readEnabled:(PSSpecifier *)specifier {
-    CFPreferencesAppSynchronize(PREFS_DOMAIN);
+    CFPreferencesAppSynchronize(CFSTR("com.iosdump.customshareicon"));
     Boolean keyExists = false;
-    Boolean en = CFPreferencesGetAppBooleanValue(CFSTR("Enabled"), PREFS_DOMAIN, &keyExists);
+    Boolean en = CFPreferencesGetAppBooleanValue(CFSTR("Enabled"), CFSTR("com.iosdump.customshareicon"), &keyExists);
     if (!keyExists) return @YES;
     return @(en);
 }
 
 - (void)setEnabled:(id)value specifier:(PSSpecifier *)specifier {
     BOOL on = [value boolValue];
-    CFPreferencesSetAppValue(CFSTR("Enabled"), on ? kCFBooleanTrue : kCFBooleanFalse, PREFS_DOMAIN);
-    CFPreferencesAppSynchronize(PREFS_DOMAIN);
+    CFPreferencesSetAppValue(CFSTR("Enabled"), on ? kCFBooleanTrue : kCFBooleanFalse, CFSTR("com.iosdump.customshareicon"));
+    CFPreferencesAppSynchronize(CFSTR("com.iosdump.customshareicon"));
+
+    NSUserDefaults *ud = [[NSUserDefaults alloc] initWithSuiteName:PREFS_ID];
+    if (!ud) ud = [NSUserDefaults standardUserDefaults];
+    [ud setBool:on forKey:ENABLED_KEY];
+    [ud synchronize];
+
     [self notifyReload];
 }
 
@@ -99,7 +125,9 @@
     NSString *key = [specifier propertyForKey:@"iconKey"];
     if (!key.length) return;
 
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:key message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:key
+                                                                   message:@"选择操作"
+                                                            preferredStyle:UIAlertControllerStyleActionSheet];
     [alert addAction:[UIAlertAction actionWithTitle:@"更换图片" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         [self pickImageForKey:key];
     }]];
@@ -109,7 +137,7 @@
         [self reloadSpecifiers];
     }]];
     [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    
+
     if ([UIDevice currentDevice].userInterfaceIdiom == UIUserInterfaceIdiomPad) {
         alert.popoverPresentationController.sourceView = self.view;
         alert.popoverPresentationController.sourceRect = CGRectMake(self.view.bounds.size.width / 2.0, 100.0, 1.0, 1.0);
@@ -119,7 +147,7 @@
 
 - (void)addNewIcon {
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"添加自定义图标"
-                                                                   message:@"输入 App 的 Bundle ID\n(如 com.tencent.xin)"
+                                                                   message:@"输入 Bundle ID\n(如 com.tencent.xin)"
                                                             preferredStyle:UIAlertControllerStyleAlert];
     [alert addTextFieldWithConfigurationHandler:^(UITextField *tf) {
         tf.placeholder = @"com.example.app";
@@ -149,7 +177,7 @@
 
 #pragma mark - UIImagePickerController
 
-- (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary *)info {
+- (void)imagePickerController:(UIImagePickerController *)picker didFinishPickingMediaWithInfo:(NSDictionary<UIImagePickerControllerInfoKey,id> *)info {
     [picker dismissViewControllerAnimated:YES completion:nil];
 
     UIImage *img = info[UIImagePickerControllerEditedImage] ?: info[UIImagePickerControllerOriginalImage];
@@ -165,16 +193,16 @@
 
     NSData *png = UIImagePNGRepresentation(resized);
     if (!png) png = UIImageJPEGRepresentation(resized, 0.92);
+    if (!png) return;
 
-    if (png) {
-        NSString *b64 = [png base64EncodedStringWithOptions:0];
-        if (b64.length) {
-            self.iconsDict[self.pendingBundleID] = b64;
-            [self saveIconsToPrefs];
-        }
-    }
-    
+    NSString *b64 = [png base64EncodedStringWithOptions:0];
+    if (!b64.length) return;
+
+    if (!self.iconsDict) self.iconsDict = [NSMutableDictionary new];
+    self.iconsDict[self.pendingBundleID] = b64;
     self.pendingBundleID = nil;
+
+    [self saveIconsToPrefs];
     [self reloadSpecifiers];
 }
 
